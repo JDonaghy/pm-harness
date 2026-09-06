@@ -995,6 +995,33 @@ def load_instructions(cfg, root):
     return "\n\n".join(parts)[:MAX_INSTRUCTION_CHARS]
 
 
+def load_issues(root):
+    path = Path(root) / "issues.json"
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text("utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    return data if isinstance(data, list) else None
+
+
+def format_issue_brief(issue):
+    lines = [f"{issue.get('id', '?')} - {issue.get('title', '')}",
+             f"  status  : {issue.get('status', 'open')}",
+             f"  priority: {issue.get('priority', '?')}",
+             f"  summary : {issue.get('summary', '')}"]
+    ctx = issue.get("context")
+    if ctx:
+        lines.append(f"  context : {ctx}")
+    for i, item in enumerate(issue.get("acceptance") or [], 1):
+        lines.append(f"  accept{i}: {item}")
+    notes = issue.get("notes")
+    if notes:
+        lines.append(f"  notes   : {notes}")
+    return "\n".join(lines)
+
+
 class ProjectContext:
     def __init__(self, root, budget_kb, extra=(), dropped=()):
         self.root = Path(root).resolve()
@@ -1702,6 +1729,7 @@ HELP_TEXT = """commands:
   /drop GLOB...      exclude files from the context
   /ctx               context statistics
   /graph             knowledge graph status (graphify-out/)
+  /issues [id]       local issue tracker (issues.json)
   /clear             reset conversation and history
   /save [file]       save transcript (default under the config dir)
   /q                 quit
@@ -1787,6 +1815,31 @@ def repl(app):
                     print(f"graph file present ({gj.stat().st_size}B) but not parsable")
             cmd = app.graphify_cmd()
             print("cli: " + (" ".join(cmd) if cmd else "not found (set CTX_GRAPHIFY_CMD)"))
+            continue
+        if line.startswith("/issues"):
+            parts = line.split()
+            issues = load_issues(app.root)
+            if issues is None:
+                print("no readable issues.json in the project root")
+                continue
+            if len(parts) > 1:
+                match = [i for i in issues if i.get("id") == parts[1]]
+                if not match:
+                    ids = ", ".join(str(i.get("id", "?")) for i in issues)
+                    print(f"no issue '{parts[1]}' - known ids: {ids}")
+                else:
+                    print(format_issue_brief(match[0]))
+                continue
+            if not issues:
+                print("issue tracker is empty")
+                continue
+            open_n = sum(1 for i in issues if str(i.get("status", "open")) == "open")
+            print(f"{len(issues)} issues ({open_n} open):")
+            for i in issues:
+                print(f"  [{str(i.get('status', 'open')):>11}] "
+                      f"{str(i.get('priority', '?')):>6}  "
+                      f"{str(i.get('id', '?')):<20} {i.get('title', '')}")
+            print("detail: /issues <id>")
             continue
         if line == "/clear":
             app.clear()

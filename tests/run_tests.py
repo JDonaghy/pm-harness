@@ -210,6 +210,24 @@ def unit_tests():
                     os.environ.pop(k, None)
                 else:
                     os.environ[k] = v
+
+        itrack = tmp / "itrack"
+        itrack.mkdir()
+        check("issues: missing file", ctxmod.load_issues(itrack) is None)
+        (itrack / "issues.json").write_text("{not json")
+        check("issues: invalid json", ctxmod.load_issues(itrack) is None)
+        (itrack / "issues.json").write_text('{"nested": true}')
+        check("issues: non-array rejected", ctxmod.load_issues(itrack) is None)
+        (itrack / "issues.json").write_text(
+            json.dumps([{"id": "x", "title": "t", "status": "open"}]))
+        check("issues: array loaded",
+              ctxmod.load_issues(itrack) == [{"id": "x", "title": "t", "status": "open"}])
+        brief = ctxmod.format_issue_brief(
+            {"id": "x", "title": "t", "status": "open", "priority": "high",
+             "summary": "sum", "acceptance": ["a1", "a2"], "notes": "n"})
+        check("issues: brief renders all fields",
+              all(s in brief for s in ("x - t", "status  : open", "priority: high",
+                                       "summary : sum", "accept1: a1", "notes   : n")))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -367,6 +385,29 @@ def integration_tests():
         check("graph: cli invoked with question",
               flines and flines[0][:2] == ["query", "what is the entry point"],
               str(flines[:1]))
+
+        r = run_ctx(["--dir", str(proj)], stdin="/issues\n/q\n")
+        check("issues: no tracker message", "no readable issues.json" in r.stdout,
+              r.stdout[-400:])
+
+        proj = fresh_project("p_issues")
+        (proj / "issues.json").write_text(json.dumps([
+            {"id": "alpha", "title": "first thing", "status": "open",
+             "priority": "high", "summary": "do the first thing"},
+            {"id": "beta", "title": "second thing", "status": "done",
+             "priority": "low", "summary": "already handled",
+             "acceptance": ["it works"]},
+        ]))
+        r = run_ctx(["--dir", str(proj)], stdin="/issues\n/issues alpha\n/q\n")
+        check("issues: list shown", "2 issues (1 open)" in r.stdout
+              and "alpha" in r.stdout and "beta" in r.stdout, r.stdout[-600:])
+        check("issues: detail for id",
+              "alpha - first thing" in r.stdout and "do the first thing" in r.stdout,
+              r.stdout[-600:])
+        check("issues: other detail not shown", "it works" not in r.stdout)
+        r = run_ctx(["--dir", str(proj)], stdin="/issues nope\n/q\n")
+        check("issues: unknown id hint", "no issue 'nope'" in r.stdout
+              and "known ids: alpha, beta" in r.stdout, r.stdout[-400:])
     finally:
         server.stop()
         shutil.rmtree(tmp, ignore_errors=True)

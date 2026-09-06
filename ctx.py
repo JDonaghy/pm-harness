@@ -12,6 +12,7 @@ outside the project directory and the config directory.
 
 import argparse
 import base64
+import difflib
 import fnmatch
 import getpass
 import json
@@ -163,6 +164,7 @@ MAX_LIST_ENTRIES = 500
 MAX_READ_CHARS = 40_000
 MAX_TOOL_RESULT_CHARS = 12_000
 MAX_RUN_OUTPUT_CHARS = 16_000
+MAX_DIFF_LINES = 200
 MAX_INSTRUCTION_CHARS = 20_000
 MAX_GRAPH_OUTPUT_CHARS = 8_000
 GRAPH_TIMEOUT = 90
@@ -1162,6 +1164,49 @@ class ToolBox:
             return f"ERROR: {e}"
         return f"wrote {len(content)} bytes to {p}"
 
+    def edit(self, args):
+        path = args.get("path") or args.get("filePath") or args.get("file")
+        old = args.get("old")
+        new = args.get("new")
+        if not path or old is None or new is None:
+            return "ERROR: edit requires path, old and new"
+        old = str(old)
+        new = str(new)
+        if not old:
+            return "ERROR: edit old must be non-empty"
+        replace_all = args.get("replace_all", args.get("replaceAll", False))
+        if isinstance(replace_all, str):
+            replace_all = replace_all.strip().lower() in ("true", "1", "yes", "all")
+        p = self._resolve(path)
+        try:
+            text = p.read_text("utf-8")
+        except (OSError, UnicodeDecodeError) as e:
+            return f"ERROR: {e}"
+        count = text.count(old)
+        if count == 0:
+            return f"ERROR: old string not found in {p}"
+        if count > 1 and not replace_all:
+            return (f"ERROR: old string found {count} times in {p} - "
+                    f"pass replace_all to replace every occurrence")
+        new_text = text.replace(old, new)
+        diff_lines = list(difflib.unified_diff(
+            text.splitlines(), new_text.splitlines(),
+            fromfile=str(p), tofile=str(p), lineterm=""))
+        if len(diff_lines) > MAX_DIFF_LINES:
+            diff_lines = diff_lines[:MAX_DIFF_LINES] + ["...[diff truncated]"]
+        if diff_lines:
+            print("\n".join(diff_lines))
+        inside = str(p.resolve()).startswith(str(self.app.root))
+        marker = "" if inside else " (OUTSIDE project dir)"
+        if not self.confirm(f"edit {p} ({count} replacement"
+                            f"{'s' if count > 1 else ''}){marker}"):
+            return "DENIED by user"
+        try:
+            p.write_text(new_text, "utf-8")
+        except OSError as e:
+            return f"ERROR: {e}"
+        return f"edited {p} ({count} replacement{'s' if count > 1 else ''})"
+
     def grep(self, args):
         pattern = args.get("pattern")
         if not pattern:
@@ -1270,7 +1315,7 @@ class ToolBox:
     def dispatch(self, name, args):
         fn = getattr(self, name, None)
         if not callable(fn):
-            return f"ERROR: unknown tool {name} (use read/list/write/grep/run)"
+            return f"ERROR: unknown tool {name} (use read/list/write/edit/grep/run)"
         try:
             return str(fn(args or {}))
         except Exception as e:
@@ -1281,6 +1326,8 @@ TOOL_SPECS = [
     ("read", "read a file", "path*, start, end (1-based line numbers, optional)"),
     ("list", "list files under a path", "path (default '.')"),
     ("write", "create or overwrite a file (the user confirms)", "path*, content*"),
+    ("edit", "replace an exact string in a file (the user confirms, diff preview)",
+     "path*, old*, new*, replace_all (optional bool)"),
     ("grep", "regex search across project files", "pattern*, glob (default '*')"),
     ("run", "run a shell command in the project directory (the user confirms)",
      "command*, timeout (seconds, default 60)"),

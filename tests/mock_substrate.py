@@ -201,6 +201,15 @@ def script_reply(text, tone):
         return "The notes say: " + (m.group(1).strip() if m else "?")
     if "[Result of write]" in text:
         return "DENIED_OK" if "DENIED" in text else "WROTE_OK"
+    if "[Result of edit]" in text:
+        if "DENIED" in text:
+            return "EDIT_DENIED_OK"
+        if "not found" in text:
+            return "EDIT_NOMATCH_OK"
+        if " times in " in text:
+            return "EDIT_AMBIG_OK"
+        m = re.search(r"\((\d+) replacements?\)", text)
+        return f"EDITED_OK_{m.group(1)}" if m else "EDIT_UNPARSED"
     if "[Result of run]" in text:
         return "RAN_OK"
     if "[Result of graph_query]" in text:
@@ -210,6 +219,18 @@ def script_reply(text, tone):
         return tool_call_reply("read", {"path": "notes.txt"})
     if "TOUCHSTONE-WRITE" in text:
         return tool_call_reply("write", {"path": "hello.txt", "content": "world"})
+    if "TOUCHSTONE-EDIT-NOMATCH" in text:
+        return tool_call_reply("edit", {"path": "notes.txt", "old": "zebra",
+                                        "new": "delta"})
+    if "TOUCHSTONE-EDIT-AMBIG" in text:
+        return tool_call_reply("edit", {"path": "notes.txt", "old": "alpha",
+                                        "new": "delta"})
+    if "TOUCHSTONE-EDIT-ALL" in text:
+        return tool_call_reply("edit", {"path": "notes.txt", "old": "alpha",
+                                        "new": "delta", "replace_all": True})
+    if "TOUCHSTONE-EDIT" in text:
+        return tool_call_reply("edit", {"path": "notes.txt", "old": "bravo",
+                                        "new": "delta"})
     if "TOUCHSTONE-RUN" in text:
         return tool_call_reply("run", {"command": "echo mockrun"})
     if "TOUCHSTONE-GRAPH" in text:

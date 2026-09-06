@@ -6,6 +6,7 @@ substrate server, exercising the full SignalR + tool loop.
 """
 
 import base64
+import io
 import json
 import os
 import re
@@ -15,6 +16,7 @@ import sys
 import tempfile
 import threading
 import urllib.parse
+from contextlib import redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -228,6 +230,70 @@ def unit_tests():
         check("issues: brief renders all fields",
               all(s in brief for s in ("x - t", "status  : open", "priority: high",
                                        "summary : sum", "accept1: a1", "notes   : n")))
+
+        espec = next((s for s in ctxmod.TOOL_SPECS if s[0] == "edit"), None)
+        check("edit: tool spec params",
+              espec is not None
+              and espec[2] == "path*, old*, new*, replace_all (optional bool)",
+              str(espec))
+        check("edit: advertised in prompt",
+              "- edit:" in ctxmod.system_prompt(tmp, "", False))
+
+        eproj = tmp / "eproj"
+        eproj.mkdir()
+        (eproj / "notes.txt").write_text("alpha bravo charlie\n")
+        eapp = ctxmod.App(ctxmod.Config(tmp / "ehome"), eproj, auto_yes=True)
+        ecap = io.StringIO()
+        with redirect_stdout(ecap):
+            out = eapp.tools.dispatch("edit", {"path": "notes.txt",
+                                               "old": "bravo", "new": "delta"})
+        check("edit: applies single match",
+              "1 replacement" in out
+              and (eproj / "notes.txt").read_text() == "alpha delta charlie\n", out)
+        check("edit: renders unified diff",
+              "-alpha bravo charlie" in ecap.getvalue()
+              and "+alpha delta charlie" in ecap.getvalue(), ecap.getvalue()[:200])
+        with redirect_stdout(io.StringIO()):
+            out = eapp.tools.dispatch("edit", {"path": "notes.txt",
+                                               "old": "zebra", "new": "x"})
+        check("edit: no-match errors clearly", "not found" in out, out)
+        (eproj / "notes.txt").write_text("alpha bravo alpha charlie\n")
+        with redirect_stdout(io.StringIO()):
+            out = eapp.tools.dispatch("edit", {"path": "notes.txt",
+                                               "old": "alpha", "new": "delta"})
+        check("edit: ambiguous match errors clearly",
+              "2 times" in out and "replace_all" in out
+              and (eproj / "notes.txt").read_text() == "alpha bravo alpha charlie\n",
+              out)
+        with redirect_stdout(io.StringIO()):
+            out = eapp.tools.dispatch("edit", {"path": "notes.txt",
+                                               "old": "alpha", "new": "delta",
+                                               "replace_all": True})
+        check("edit: replace_all applies every match",
+              "2 replacements" in out
+              and (eproj / "notes.txt").read_text() == "delta bravo delta charlie\n",
+              out)
+        with redirect_stdout(io.StringIO()):
+            out = eapp.tools.dispatch("edit", {"path": "gone.txt",
+                                               "old": "a", "new": "b"})
+        check("edit: missing file errors", out.startswith("ERROR:"), out)
+        with redirect_stdout(io.StringIO()):
+            out = eapp.tools.dispatch("edit", {"old": "a", "new": "b"})
+        check("edit: missing args error", "requires path" in out, out)
+        (eproj / "notes.txt").write_text("alpha bravo alpha charlie\n")
+        with redirect_stdout(io.StringIO()):
+            out = eapp.tools.dispatch("edit", {"path": "notes.txt",
+                                               "old": "alpha", "new": "delta",
+                                               "replace_all": "true"})
+        check("edit: string replace_all coerced true",
+              "2 replacements" in out, out)
+        (eproj / "notes.txt").write_text("alpha bravo alpha charlie\n")
+        with redirect_stdout(io.StringIO()):
+            out = eapp.tools.dispatch("edit", {"path": "notes.txt",
+                                               "old": "alpha", "new": "delta",
+                                               "replace_all": "false"})
+        check("edit: string replace_all coerced false",
+              "2 times" in out, out)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -341,6 +407,50 @@ def integration_tests():
                     stdin="\n")
         check("write denied: no file", not (proj / "hello.txt").exists())
         check("write denied: model ack", "DENIED_OK" in r.stdout, r.stdout[-400:])
+
+        proj = fresh_project("p_edit")
+        r = run_ctx(["--dir", str(proj), "ask", "Edit notes.txt. TOUCHSTONE-EDIT"],
+                    stdin="y\n")
+        check("edit confirmed: file updated",
+              (proj / "notes.txt").read_text() == "alpha delta charlie\n",
+              (proj / "notes.txt").read_text())
+        check("edit confirmed: tool shown", "-> edit notes.txt" in r.stdout,
+              r.stdout[-400:])
+        check("edit confirmed: diff preview shown",
+              "-alpha bravo charlie" in r.stdout and "+alpha delta charlie" in r.stdout,
+              r.stdout[-400:])
+        check("edit confirmed: model ack", "EDITED_OK_1" in r.stdout, r.stdout[-400:])
+
+        proj = fresh_project("p_edit_deny")
+        r = run_ctx(["--dir", str(proj), "ask", "Edit notes.txt. TOUCHSTONE-EDIT"],
+                    stdin="\n")
+        check("edit denied: file untouched",
+              (proj / "notes.txt").read_text() == "alpha bravo charlie\n")
+        check("edit denied: model ack", "EDIT_DENIED_OK" in r.stdout, r.stdout[-400:])
+
+        proj = fresh_project("p_edit_nomatch")
+        r = run_ctx(["--dir", str(proj), "ask", "Edit notes.txt. TOUCHSTONE-EDIT-NOMATCH"],
+                    stdin="")
+        check("edit no-match: file untouched",
+              (proj / "notes.txt").read_text() == "alpha bravo charlie\n")
+        check("edit no-match: model ack", "EDIT_NOMATCH_OK" in r.stdout, r.stdout[-400:])
+
+        proj = fresh_project("p_edit_ambig")
+        (proj / "notes.txt").write_text("alpha bravo alpha charlie\n")
+        r = run_ctx(["--dir", str(proj), "ask", "Edit notes.txt. TOUCHSTONE-EDIT-AMBIG"],
+                    stdin="")
+        check("edit ambiguous: file untouched",
+              (proj / "notes.txt").read_text() == "alpha bravo alpha charlie\n")
+        check("edit ambiguous: model ack", "EDIT_AMBIG_OK" in r.stdout, r.stdout[-400:])
+
+        proj = fresh_project("p_edit_all")
+        (proj / "notes.txt").write_text("alpha bravo alpha charlie\n")
+        r = run_ctx(["--dir", str(proj), "ask", "Edit every match. TOUCHSTONE-EDIT-ALL"],
+                    stdin="y\n")
+        check("edit replace_all: both replaced",
+              (proj / "notes.txt").read_text() == "delta bravo delta charlie\n",
+              (proj / "notes.txt").read_text())
+        check("edit replace_all: model ack", "EDITED_OK_2" in r.stdout, r.stdout[-400:])
 
         proj = fresh_project("p_run")
         r = run_ctx(["--yes", "--dir", str(proj), "ask", "Run the command. TOUCHSTONE-RUN"])

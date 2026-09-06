@@ -152,6 +152,64 @@ def unit_tests():
         check("http messages tool merged into user turn",
               "[Result of read]: alpha bravo charlie" in msgs[2]["content"]
               and "and now summarize" in msgs[2]["content"])
+
+        gproj = tmp / "gproj"
+        gproj.mkdir()
+        (gproj / "graphify-out").mkdir()
+        (gproj / "graphify-out" / "graph.json").write_text(
+            json.dumps({"nodes": [{"id": "a"}, {"id": "b"}],
+                        "edges": [{"source": "a", "target": "b"}]}))
+        check("graph detection on", ctxmod.graph_available(gproj))
+        check("graph detection off", not ctxmod.graph_available(tmp))
+
+        sp = ctxmod.system_prompt(gproj, "BE-NICE-MARKER", True)
+        check("prompt: instructions and graph advertised",
+              "BE-NICE-MARKER" in sp and "KNOWLEDGE GRAPH" in sp
+              and "graph_query" in sp and "graph_explain" in sp)
+        sp2 = ctxmod.system_prompt(tmp, "", False)
+        check("prompt: no graph section when absent",
+              "graph_query" not in sp2 and "KNOWLEDGE GRAPH" not in sp2)
+
+        (tmp / "home").mkdir(exist_ok=True)
+        (tmp / "home" / "AGENTS.md").write_text("global-rule-77\n")
+        (gproj / "AGENTS.md").write_text("project-rule-88\n")
+        instr = ctxmod.load_instructions(cfg, gproj)
+        check("instructions global+project loaded in order",
+              "global-rule-77" in instr and "project-rule-88" in instr
+              and instr.index("global-rule-77") < instr.index("project-rule-88"))
+        check("instructions missing when no files",
+              ctxmod.load_instructions(ctxmod.Config(tmp / "home2"), tmp) == "")
+
+        saved = {k: os.environ.get(k) for k in
+                 ("CTX_GRAPHIFY_CMD", "FAKE_GRAPHIFY_LOG")}
+        glog = tmp / "glog.jsonl"
+        os.environ["CTX_GRAPHIFY_CMD"] = f"{sys.executable} {ROOT / 'tests' / 'fake_graphify.py'}"
+        os.environ["FAKE_GRAPHIFY_LOG"] = str(glog)
+        try:
+            gcfg = ctxmod.Config(tmp / "home3")
+            gapp = ctxmod.App(gcfg, gproj)
+            out = gapp.tools.dispatch("graph_query", {"question": "how does auth work"})
+            check("graph_query via fake cli",
+                  "GRAPH-ANSWER[how does auth work]" in out, out)
+            out = gapp.tools.dispatch("graph_path", {"from": "Auth", "to": "Database"})
+            check("graph_path arg mapping", "GRAPH-PATH: Auth -> Database" in out, out)
+            out = gapp.tools.dispatch("graph_explain", {"node": "SwinTransformer"})
+            check("graph_explain arg mapping", "GRAPH-EXPLAIN: SwinTransformer" in out, out)
+            logged = [json.loads(l) for l in glog.read_text().splitlines()]
+            check("graph cli argv for query",
+                  logged[0] == ["query", "how does auth work", "--budget", "2000"],
+                  str(logged[0]))
+            check("graph cli argv for path",
+                  logged[1] == ["path", "Auth", "Database"], str(logged[1]))
+            napp = ctxmod.App(gcfg, tmp)
+            out = napp.tools.dispatch("graph_query", {"question": "x"})
+            check("graph tool without graph errors", "no knowledge graph" in out, out)
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -217,8 +275,10 @@ def integration_tests():
             CTX_WS_BASE=f"ws://127.0.0.1:{server.port}/m365Copilot/Chathub",
         )
 
-        def run_ctx(args, stdin=None, home=None):
+        def run_ctx(args, stdin=None, home=None, extra_env=None):
             env = dict(env_base, CTX_HOME=str(home or (tmp / "home")))
+            if extra_env:
+                env.update(extra_env)
             return subprocess.run([sys.executable, ctx_py] + args,
                                   input=stdin, capture_output=True, text=True,
                                   env=env, timeout=90)
@@ -281,6 +341,32 @@ def integration_tests():
         r = run_ctx(["--dir", str(proj), "ask", "Inspect the project. TOUCHSTONE-CONFAB"])
         check("confab: nudge fired", "nudging" in r.stderr, r.stderr[-400:])
         check("confab: recovered", "RECOVERED" in r.stdout, r.stdout[-400:])
+
+        proj = fresh_project("p_graph")
+        (proj / "AGENTS.md").write_text("Always cite file paths.\n")
+        gdir = proj / "graphify-out"
+        gdir.mkdir()
+        (gdir / "graph.json").write_text(
+            json.dumps({"nodes": [{"id": "a"}, {"id": "b"}],
+                        "edges": [{"source": "a", "target": "b"}]}))
+        fake_log = tmp / "gfake.jsonl"
+        r = run_ctx(["--dir", str(proj), "ask", "Use the graph. TOUCHSTONE-GRAPH"],
+                    extra_env={
+                        "CTX_GRAPHIFY_CMD":
+                            f"{sys.executable} {ROOT / 'tests' / 'fake_graphify.py'}",
+                        "FAKE_GRAPHIFY_LOG": str(fake_log),
+                    })
+        check("graph: tool executed", "-> graph_query" in r.stdout, r.stdout[-400:])
+        check("graph: final answer",
+              "The graph says: entrypoint is main.py" in r.stdout, r.stdout[-400:])
+        check("graph: prompt advertised graph",
+              any(e.get("graph_adv") for e in server.entries))
+        check("graph: AGENTS.md reached the prompt",
+              any(e.get("agents_md") for e in server.entries))
+        flines = [json.loads(l) for l in fake_log.read_text().splitlines()]
+        check("graph: cli invoked with question",
+              flines and flines[0][:2] == ["query", "what is the entry point"],
+              str(flines[:1]))
     finally:
         server.stop()
         shutil.rmtree(tmp, ignore_errors=True)

@@ -166,7 +166,9 @@ class Conn:
         text = args.get("message", {}).get("text", "")
         is_start = args.get("isStartOfSession")
         self.server.log({"path": path, "tone": tone, "is_start": is_start,
-                         "head": text[:100]})
+                         "head": text[:100],
+                         "agents_md": "USER INSTRUCTIONS" in text,
+                         "graph_adv": "KNOWLEDGE GRAPH" in text})
         reply = self.server.script_reply(text, tone)
         self.send_text(json.dumps({"type": 6}) + RS)
         self.send_text(json.dumps({
@@ -201,12 +203,17 @@ def script_reply(text, tone):
         return "DENIED_OK" if "DENIED" in text else "WROTE_OK"
     if "[Result of run]" in text:
         return "RAN_OK"
+    if "[Result of graph_query]" in text:
+        m = re.search(r"GRAPH-ANSWER\[[^\]]*\]: (.*)", text)
+        return "The graph says: " + (m.group(1).strip() if m else "?")
     if "TOUCHSTONE-READ" in text:
         return tool_call_reply("read", {"path": "notes.txt"})
     if "TOUCHSTONE-WRITE" in text:
         return tool_call_reply("write", {"path": "hello.txt", "content": "world"})
     if "TOUCHSTONE-RUN" in text:
         return tool_call_reply("run", {"command": "echo mockrun"})
+    if "TOUCHSTONE-GRAPH" in text:
+        return tool_call_reply("graph_query", {"question": "what is the entry point"})
     if "TOUCHSTONE-CONFAB" in text:
         return CONFAB_REPLY
     if "TOUCHSTONE-TONE" in text:

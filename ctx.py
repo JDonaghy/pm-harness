@@ -17,6 +17,7 @@ import getpass
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import ssl
@@ -141,13 +142,14 @@ DEFAULT_CONFIG = {
     "base_url": "",
     "api_key": "",
     "max_tokens": 8192,
+    "graphify_cmd": "",
 }
 
 SKIP_DIRS = {
     ".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv",
     "env", "dist", "build", "target", "vendor", ".tox", ".mypy_cache",
     ".pytest_cache", ".idea", ".vscode", ".ruff_cache", "coverage",
-    ".next", ".cache",
+    ".next", ".cache", "graphify-out",
 }
 BINARY_EXTS = {
     ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".pdf", ".zip",
@@ -161,6 +163,10 @@ MAX_LIST_ENTRIES = 500
 MAX_READ_CHARS = 40_000
 MAX_TOOL_RESULT_CHARS = 12_000
 MAX_RUN_OUTPUT_CHARS = 16_000
+MAX_INSTRUCTION_CHARS = 20_000
+MAX_GRAPH_OUTPUT_CHARS = 8_000
+GRAPH_TIMEOUT = 90
+GRAPH_JSON = "graphify-out/graph.json"
 
 TOOL_CALL_START = "<tool" + "_call>"
 TOOL_CALL_END = "</tool" + "_call>"
@@ -195,6 +201,12 @@ environment:
   CTX_HOME   config+token dir        (default ~/.config/ctx)
   CTX_TOKEN  access token override   (bypasses the token cache)
   CTX_MODEL  default model override
+
+extras:
+  AGENTS.md in the project root or the config dir is prepended to every prompt
+  (project file is git-ignored by convention). If graphify-out/graph.json exists,
+  the agent gains graph_query / graph_path / graph_explain tools backed by the
+  graphify CLI. CTX_GRAPHIFY_CMD overrides how that CLI is invoked.
 
 other backends (any openai- or anthropic-compatible endpoint):
   CTX_PROVIDER=chat|messages|responses CTX_BASE_URL=https://host/v1 \\
@@ -277,7 +289,7 @@ class Config:
         if os.environ.get("CTX_MODEL"):
             self.data["model"] = os.environ["CTX_MODEL"]
         for var, key in (("CTX_PROVIDER", "provider"), ("CTX_BASE_URL", "base_url"),
-                         ("CTX_API_KEY", "api_key")):
+                         ("CTX_API_KEY", "api_key"), ("CTX_GRAPHIFY_CMD", "graphify_cmd")):
             if os.environ.get(var):
                 self.data[key] = os.environ[var]
         if os.environ.get("CTX_MAX_TOKENS"):
@@ -948,6 +960,41 @@ def looks_binary(path):
     return b"\x00" in head
 
 
+def graph_available(root):
+    return (Path(root) / GRAPH_JSON).is_file()
+
+
+def graphify_command(cfg, root):
+    raw = cfg.data.get("graphify_cmd") or ""
+    if raw:
+        return shlex.split(raw)
+    if shutil.which("graphify"):
+        return ["graphify"]
+    marker = Path(root) / "graphify-out" / ".graphify_python"
+    if marker.is_file():
+        try:
+            interp = marker.read_text("utf-8").strip()
+        except OSError:
+            interp = ""
+        if interp:
+            return [interp, "-m", "graphify"]
+    return None
+
+
+def load_instructions(cfg, root):
+    parts = []
+    for label, path in (("global", Path(cfg.home) / "AGENTS.md"),
+                        ("project", Path(root) / "AGENTS.md")):
+        try:
+            if path.is_file():
+                text = path.read_text("utf-8", errors="replace").strip()
+                if text:
+                    parts.append(f"[{label}]\n{text}")
+        except OSError:
+            pass
+    return "\n\n".join(parts)[:MAX_INSTRUCTION_CHARS]
+
+
 class ProjectContext:
     def __init__(self, root, budget_kb, extra=(), dropped=()):
         self.root = Path(root).resolve()
@@ -1138,6 +1185,61 @@ class ToolBox:
             out = out[:MAX_RUN_OUTPUT_CHARS] + "\n...[truncated]"
         return f"exit={proc.returncode}\n{out.strip() or '(no output)'}"
 
+    def _graph_prelude(self):
+        if not graph_available(self.app.root):
+            return None, ("ERROR: no knowledge graph at graphify-out/graph.json - "
+                          "build one first (graphify CLI) or answer from the files")
+        cmd = graphify_command(self.app.cfg, self.app.root)
+        if not cmd:
+            return None, ("ERROR: graphify command not found - install graphify "
+                          "or set CTX_GRAPHIFY_CMD")
+        return cmd, None
+
+    def _run_graph(self, cmd_args):
+        cmd, err = self._graph_prelude()
+        if err:
+            return err
+        try:
+            proc = subprocess.run(cmd + cmd_args, cwd=str(self.app.root),
+                                  capture_output=True, text=True, timeout=GRAPH_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            return f"ERROR: graphify timed out after {GRAPH_TIMEOUT}s"
+        except OSError as e:
+            return f"ERROR: {e}"
+        out = ((proc.stdout or "") + (proc.stderr or "")).strip() or "(no output)"
+        if len(out) > MAX_GRAPH_OUTPUT_CHARS:
+            out = out[:MAX_GRAPH_OUTPUT_CHARS] + "\n...[truncated]"
+        return out
+
+    def graph_query(self, args):
+        question = args.get("question") or args.get("q")
+        if not question:
+            return "ERROR: graph_query requires question"
+        cmd_args = ["query", str(question)]
+        mode = str(args.get("mode", "bfs")).lower()
+        if mode in ("dfs", "deep"):
+            cmd_args.append("--dfs")
+        try:
+            budget = int(args.get("budget", 2000))
+        except (TypeError, ValueError):
+            budget = 2000
+        cmd_args += ["--budget", str(max(200, min(budget, 8000)))]
+        return self._run_graph(cmd_args)
+
+    def graph_path(self, args):
+        a = args.get("from") or args.get("source") or args.get("start") or args.get("a")
+        b = args.get("to") or args.get("target") or args.get("end") or args.get("b")
+        if not a or not b:
+            return "ERROR: graph_path requires from and to"
+        return self._run_graph(["path", str(a), str(b)])
+
+    def graph_explain(self, args):
+        node = (args.get("node") or args.get("name")
+                or args.get("topic") or args.get("concept"))
+        if not node:
+            return "ERROR: graph_explain requires node"
+        return self._run_graph(["explain", str(node)])
+
     def dispatch(self, name, args):
         fn = getattr(self, name, None)
         if not callable(fn):
@@ -1157,11 +1259,34 @@ TOOL_SPECS = [
      "command*, timeout (seconds, default 60)"),
 ]
 
+GRAPH_TOOL_SPECS = [
+    ("graph_query",
+     "ask the codebase knowledge graph a question (architecture, data flow, dependencies)",
+     "question*, mode (bfs|dfs, default bfs), budget"),
+    ("graph_path", "shortest relationship path between two concepts in the graph",
+     "from*, to*"),
+    ("graph_explain", "plain-language explanation of one concept or node in the graph",
+     "node*"),
+]
 
-def system_prompt(root):
-    tools = "\n".join(f"- {n}: {d} | {p}" for n, d, p in TOOL_SPECS)
-    return f"""You are a coding agent running in a terminal on Linux (WSL). Working directory: {root}.
-The user asks questions about the codebase and requests changes. You act through tool calls only.
+
+def tool_spec_lines(has_graph=False):
+    specs = list(TOOL_SPECS) + (list(GRAPH_TOOL_SPECS) if has_graph else [])
+    return "\n".join(f"- {n}: {d} | {p}" for n, d, p in specs)
+
+
+def system_prompt(root, instructions="", has_graph=False):
+    tools = tool_spec_lines(has_graph)
+    head = (f"You are a coding agent running in a terminal on Linux (WSL). "
+            f"Working directory: {root}.\n")
+    if instructions:
+        head += f"\nUSER INSTRUCTIONS\nThese override the defaults where they conflict.\n{instructions}\n"
+    if has_graph:
+        head += ("\nKNOWLEDGE GRAPH\nA knowledge graph of this codebase is available "
+                 "(graphify-out/graph.json). For architecture questions - how X works, "
+                 "what depends on Y, where Z lives - prefer the graph tools over reading "
+                 "many files. Use read/grep when you need exact source lines.\n")
+    return head + f"""The user asks questions about the codebase and requests changes. You act through tool calls only.
 
 TOOL PROTOCOL
 When you need to inspect files, modify files, or run a command, respond with EXACTLY one tool call in this format and nothing else:
@@ -1180,10 +1305,11 @@ Rules:
 """
 
 
-def first_message(ctx, user_text):
+def first_message(ctx, user_text, instructions="", has_graph=False):
     tree, blocks = ctx.render()
     files = f"<files>\n{tree}\n\n{blocks}\n</files>" if blocks else f"<files>\n{tree}\n</files>"
-    return (f"{system_prompt(ctx.root)}\nPROJECT FILES\n{files}\n\n"
+    sys_part = system_prompt(ctx.root, instructions, has_graph)
+    return (f"{sys_part}\nPROJECT FILES\n{files}\n\n"
             f"CONVERSATION\n<user>\n{user_text}\n</user>\n")
 
 
@@ -1327,6 +1453,22 @@ class App:
             return self.cfg.model_tone(self.model)
         return self.model
 
+    def instruction_text(self):
+        return load_instructions(self.cfg, self.root)
+
+    def has_graph(self):
+        return graph_available(self.root)
+
+    def sys_prompt(self):
+        return system_prompt(self.root, self.instruction_text(), self.has_graph())
+
+    def first_msg(self, user_text):
+        return first_message(self.ctx, user_text, self.instruction_text(),
+                             self.has_graph())
+
+    def graphify_cmd(self):
+        return graphify_command(self.cfg, self.root)
+
     def creds(self):
         data = self.store.acquire()
         token = data["access_token"]
@@ -1356,7 +1498,7 @@ class App:
             raise CtxError("http provider needs CTX_BASE_URL and CTX_API_KEY")
         path = PROVIDER_PATHS[provider]
         url = base if base.endswith(path) else base + path
-        sys_text = system_prompt(self.root)
+        sys_text = self.sys_prompt()
         msgs = build_http_messages(self)
         max_tokens = int(self.cfg.data["max_tokens"])
         headers = {"Authorization": "Bearer " + key}
@@ -1425,12 +1567,12 @@ class App:
         if self.session is None or self.rotate_pending:
             self.new_session()
             if self.history:
-                payload = (f"{system_prompt(self.root)}\nCONVERSATION SO FAR\n"
+                payload = (f"{self.sys_prompt()}\nCONVERSATION SO FAR\n"
                            f"{flatten_history(self.history)}\n\n<user>\n{user_text}\n</user>\n")
             else:
-                payload = first_message(self.ctx, user_text)
+                payload = self.first_msg(user_text)
         elif self.session.turn_count == 0:
-            payload = first_message(self.ctx, user_text)
+            payload = self.first_msg(user_text)
         else:
             payload = f"<user>\n{user_text}\n</user>\n"
         self.history.append({"role": "user", "text": user_text})
@@ -1559,6 +1701,7 @@ HELP_TEXT = """commands:
   /add GLOB...       force-include files in the context
   /drop GLOB...      exclude files from the context
   /ctx               context statistics
+  /graph             knowledge graph status (graphify-out/)
   /clear             reset conversation and history
   /save [file]       save transcript (default under the config dir)
   /q                 quit
@@ -1630,6 +1773,20 @@ def repl(app):
             tree, blocks = app.ctx.render()
             print(f"{n} files, {size} bytes on disk, "
                   f"prompt context {len(tree) + len(blocks)} chars")
+            continue
+        if line == "/graph":
+            gj = app.root / GRAPH_JSON
+            if not gj.is_file():
+                print("no graph (graphify-out/graph.json missing)")
+            else:
+                try:
+                    data = json.loads(gj.read_text("utf-8"))
+                    print(f"graph: {len(data.get('nodes', []))} nodes, "
+                          f"{len(data.get('edges', []))} edges")
+                except Exception:
+                    print(f"graph file present ({gj.stat().st_size}B) but not parsable")
+            cmd = app.graphify_cmd()
+            print("cli: " + (" ".join(cmd) if cmd else "not found (set CTX_GRAPHIFY_CMD)"))
             continue
         if line == "/clear":
             app.clear()

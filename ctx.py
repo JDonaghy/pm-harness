@@ -186,7 +186,8 @@ CONFAB_PATTERNS = [
 
 USAGE = """examples:
   ctx login              first-time auth (device code shown for the host browser)
-  ctx login --paste      auth by pasting a token grabbed from browser devtools
+  ctx login --paste      auth by pasting a token from browser devtools
+                         (works around conditional access blocks)
   ctx status             token expiry, model, config location
   ctx                    interactive session in the current folder
   ctx ask "summarize ."  one question, one answer, then exit
@@ -469,7 +470,9 @@ def device_login(store):
                 interval += 5
                 continue
             if "expired_token" in msg:
-                raise CtxError("device code expired - run login again") from None
+                raise CtxError("device code expired - run login again, or use ctx login "
+                               "--paste if the browser said the sign-in does not meet "
+                               "the criteria to access this resource") from None
             if "authorization_declined" in msg:
                 raise CtxError("sign-in was declined") from None
             raise
@@ -484,7 +487,9 @@ def device_login(store):
         store.save(access, result.get("refresh_token"), expires_at, claims)
         print("  signed in as: " + (claims.get("preferred_username") or "unknown"))
         return
-    raise CtxError("device code expired - run login again")
+    raise CtxError("device code expired - run login again, or use ctx login --paste if "
+                   "the browser said the sign-in does not meet the criteria to access "
+                   "this resource")
 
 
 def paste_login(store):
@@ -2076,9 +2081,16 @@ def main():
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--timeout", type=int, help="per-request timeout in seconds")
     sub = parser.add_subparsers(dest="cmd")
-    p_login = sub.add_parser("login", help="authenticate (device code flow)")
+    p_login = sub.add_parser(
+        "login", help="authenticate (device code flow)",
+        epilog="conditional access can block the device code flow: the browser says "
+               "the sign-in does not meet the criteria to access this resource. "
+               "remedy: sign in at m365.cloud.microsoft/chat, then devtools -> "
+               "Network -> WS -> substrate.office.com frame url, copy its "
+               "access_token query parameter and run: ctx login --paste")
     p_login.add_argument("--paste", action="store_true",
-                         help="paste a token from browser devtools instead")
+                         help="paste a token from browser devtools instead "
+                              "(works around conditional access blocks)")
     sub.add_parser("logout", help="remove the stored token")
     sub.add_parser("status", help="show config and token status")
     p_ask = sub.add_parser("ask", help="ask one question and exit")

@@ -402,6 +402,41 @@ def unit_tests():
             check("sessions: none saved raises", False)
         except ctxmod.CtxError as e:
             check("sessions: none saved raises", "no saved sessions" in str(e), str(e))
+
+        class NoSaveStore:
+            def save(self, *a):
+                raise AssertionError("unexpected token save")
+
+        state = {}
+
+        def fake_form(url, data, timeout=30):
+            if url.endswith("/devicecode"):
+                return {"user_code": "CODE", "device_code": "dc",
+                        "verification_uri": "https://microsoft.com/devicelogin",
+                        "interval": 0, "expires_in": state["expiry"]}
+            raise ctxmod.CtxError(state["poll_error"])
+
+        orig_form, orig_open = ctxmod.http_form, ctxmod.open_host_browser
+        ctxmod.http_form, ctxmod.open_host_browser = fake_form, (lambda url: True)
+        try:
+            state.update(expiry=5, poll_error="expired_token: code expired")
+            err = ""
+            with redirect_stdout(io.StringIO()):
+                try:
+                    ctxmod.device_login(NoSaveStore())
+                except ctxmod.CtxError as e:
+                    err = str(e)
+            check("login: expiry error hints at --paste", "--paste" in err, err)
+            state.update(expiry=0, poll_error="authorization_pending: waiting")
+            err = ""
+            with redirect_stdout(io.StringIO()):
+                try:
+                    ctxmod.device_login(NoSaveStore())
+                except ctxmod.CtxError as e:
+                    err = str(e)
+            check("login: deadline error hints at --paste", "--paste" in err, err)
+        finally:
+            ctxmod.http_form, ctxmod.open_host_browser = orig_form, orig_open
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

@@ -294,6 +294,114 @@ def unit_tests():
                                                "replace_all": "false"})
         check("edit: string replace_all coerced false",
               "2 times" in out, out)
+
+        nr = ctxmod.normalize_resume_argv
+        check("resume argv: bare flag", nr(["--resume"]) == ["--resume="])
+        check("resume argv: before subcommand",
+              nr(["--resume", "ask", "hi"]) == ["--resume=", "ask", "hi"])
+        check("resume argv: before option",
+              nr(["--resume", "--dir", "x"]) == ["--resume=", "--dir", "x"])
+        check("resume argv: id consumed", nr(["--resume", "ab12"]) == ["--resume", "ab12"])
+        check("resume argv: inline form untouched", nr(["--resume=ab12"]) == ["--resume=ab12"])
+        check("resume argv: passthrough",
+              nr(["--dir", "x", "ask", "hi"]) == ["--dir", "x", "ask", "hi"])
+
+        shome = tmp / "shome"
+        sapp = ctxmod.App(ctxmod.Config(shome), tmp)
+        sapp.history = [{"role": "user", "text": "hello"}]
+        sid = sapp.save_session()
+        sp = shome / "sessions" / (sid + ".json")
+        check("session: save mints id and writes file",
+              bool(sid) and len(sid) == 8 and sp.is_file(), str(sid))
+        sapp.history.append({"role": "assistant", "text": "hi"})
+        check("session: resave keeps slot", sapp.save_session() == sid)
+        sdata = json.loads(sp.read_text())
+        check("session: file holds history and meta",
+              len(sdata["history"]) == 2 and sdata["model"] == sapp.model
+              and sdata["provider"] == "m365" and sdata["root"] == str(tmp)
+              and sdata["created"] and sdata["updated"], str(sdata)[:200])
+        check("session: save skipped on empty history",
+              ctxmod.App(ctxmod.Config(tmp / "shome9"), tmp).save_session() is None)
+
+        rapp = ctxmod.App(ctxmod.Config(shome), tmp)
+        n = rapp.restore_session({
+            "id": sid, "created": "c",
+            "history": [{"role": "user", "text": "a"},
+                        {"role": "bogus", "text": "x"},
+                        {"text": "no role"},
+                        {"role": "tool", "text": "t"}],
+            "model": "auto", "conversation_id": "conv-1",
+            "session_id": "sess-1", "turn_count": 3})
+        check("session: restore sanitizes history", n == 2 and len(rapp.history) == 2)
+        check("session: restore slot, model and m365 ids",
+              rapp.session_slot == sid and rapp.model == "auto"
+              and rapp.session.conversation_id == "conv-1"
+              and rapp.session.session_id == "sess-1"
+              and rapp.session.turn_count == 3)
+        rapp.history.append({"role": "user", "text": "more"})
+        check("session: save after restore keeps slot", rapp.save_session() == sid)
+        rapp.clear()
+        check("session: clear detaches",
+              rapp.session_slot is None and rapp.history == [] and rapp.session is None)
+
+        capp = ctxmod.App(ctxmod.Config(shome), tmp)
+        capp.restore_session({"id": "cc", "history": [{"role": "user", "text": "a"}],
+                              "conversation_id": "conv-2", "turn_count": "x",
+                              "session_id": 12})
+        check("session: restore coerces bad fields",
+              capp.session.turn_count == 0
+              and isinstance(capp.session.session_id, str) and capp.session.session_id)
+
+        mapp = ctxmod.App(ctxmod.Config(shome), tmp)
+        mapp.restore_session({"id": "mm", "history": [{"role": "user", "text": "a"}],
+                              "model": "not-a-tone"})
+        check("session: unknown m365 model falls back",
+              mapp.model == ctxmod.Config(shome).data["model"] and mapp.session is None)
+
+        pcfg = ctxmod.Config(tmp / "phome")
+        pcfg.data["provider"] = "chat"
+        papp = ctxmod.App(pcfg, tmp)
+        papp.restore_session({"id": "pp", "history": [{"role": "user", "text": "a"}],
+                              "model": "any-model-id", "conversation_id": "conv-9",
+                              "turn_count": 5})
+        check("session: http restore takes model, ignores conversation",
+              papp.model == "any-model-id" and papp.session is None)
+
+        lhome = tmp / "lhome"
+        ldir = lhome / "sessions"
+        ldir.mkdir(parents=True)
+        (ldir / "aaa.json").write_text(json.dumps(
+            {"id": "aaa", "updated": "2026-01-01T00:00:00Z", "model": "m1",
+             "history": [{"role": "user", "text": "x"}]}))
+        (ldir / "bbb.json").write_text(json.dumps(
+            {"id": "bbb", "updated": "2026-02-01T00:00:00Z", "model": "m2",
+             "history": [{"role": "user", "text": "y"}]}))
+        (ldir / "ccc.json").write_text("{broken")
+        (ldir / "ddd.json").write_text(json.dumps(
+            {"updated": "2026-03-01T00:00:00Z", "history": []}))
+        (ldir / "eee.json").write_text(json.dumps(
+            {"updated": "2026-04-01T00:00:00Z",
+             "history": [{"role": "user", "text": "z"}]}))
+        lcfg = ctxmod.Config(lhome)
+        found = ctxmod.find_sessions(lcfg)
+        check("sessions: newest first, bad files skipped",
+              [s["id"] for s in found] == ["eee", "bbb", "aaa"],
+              str([s["id"] for s in found]))
+        check("sessions: stem fallback id", found[0]["id"] == "eee")
+        check("sessions: resume latest", ctxmod.resume_session(lcfg, "")["id"] == "eee")
+        check("sessions: resume by id", ctxmod.resume_session(lcfg, "bbb")["id"] == "bbb")
+        check("sessions: resume by id with .json suffix",
+              ctxmod.resume_session(lcfg, "bbb.json")["id"] == "bbb")
+        try:
+            ctxmod.resume_session(lcfg, "zzz")
+            check("sessions: unknown id raises", False)
+        except ctxmod.CtxError as e:
+            check("sessions: unknown id raises", "no saved session 'zzz'" in str(e), str(e))
+        try:
+            ctxmod.resume_session(ctxmod.Config(tmp / "lhome-empty"), "")
+            check("sessions: none saved raises", False)
+        except ctxmod.CtxError as e:
+            check("sessions: none saved raises", "no saved sessions" in str(e), str(e))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -322,7 +430,9 @@ def make_http_mock(provider):
             reply = script_reply(last, "http")
             log.append({"provider": provider, "model": model, "head": last[:100],
                         "auth": self.headers.get("Authorization", ""),
-                        "path": self.path})
+                        "path": self.path,
+                        "hist": any("The notes say" in content_text(m["content"])
+                                    for m in items)})
             if provider == "chat":
                 out = {"choices": [{"message": {"role": "assistant", "content": reply}}]}
             elif provider == "messages":
@@ -518,6 +628,93 @@ def integration_tests():
         r = run_ctx(["--dir", str(proj)], stdin="/issues nope\n/q\n")
         check("issues: unknown id hint", "no issue 'nope'" in r.stdout
               and "known ids: alpha, beta" in r.stdout, r.stdout[-400:])
+
+        proj_s = fresh_project("p_sess")
+        shome = tmp / "home-sess"
+        r = run_ctx(["--dir", str(proj_s), "ask", "Read notes.txt please. TOUCHSTONE-READ"],
+                    home=shome)
+        sdir = shome / "sessions"
+        saved = sorted(sdir.glob("*.json"))
+        check("sessions: ask auto-saves", len(saved) == 1, str(saved))
+        sdata_a = json.loads(saved[0].read_text()) if saved else {}
+        sid_a = sdata_a.get("id")
+        conv_a = sdata_a.get("conversation_id")
+        check("sessions: history and m365 ids persisted",
+              bool(sid_a) and bool(conv_a) and sdata_a.get("model") == "gpt-5.6"
+              and sdata_a.get("provider") == "m365"
+              and sdata_a.get("root") == str(proj_s)
+              and sdata_a.get("turn_count", 0) >= 1
+              and any(h.get("text") == "Read notes.txt please. TOUCHSTONE-READ"
+                      for h in sdata_a.get("history", [])),
+              str(sdata_a)[:200])
+
+        proj_s2 = fresh_project("p_sess2")
+        r = run_ctx(["--dir", str(proj_s2), "ask", "Read notes.txt please. TOUCHSTONE-READ"],
+                    home=shome)
+        by_root = {}
+        for p in sdir.glob("*.json"):
+            d = json.loads(p.read_text())
+            by_root[d.get("root")] = d
+        sdata_b = by_root.get(str(proj_s2), {})
+        sid_b = sdata_b.get("id")
+        conv_b = sdata_b.get("conversation_id")
+        check("sessions: second ask gets its own file",
+              bool(sid_b) and sid_b != sid_a and bool(conv_b) and conv_b != conv_a)
+
+        r = run_ctx(["--dir", str(proj_s2), "--resume"],
+                    stdin="TOUCHSTONE-SESS2\n/q\n", home=shome)
+        check("resume latest: picks newest session",
+              f"resumed session {sid_b}" in r.stdout, r.stdout[-400:])
+        check("resume latest: reply", "RESUMED_OK" in r.stdout, r.stdout[-400:])
+        last = server.entries[-1] if server.entries else {}
+        check("resume latest: reuses stored conversation id",
+              last.get("conversation_id") == conv_b, str(last))
+        check("resume latest: continues server session",
+              last.get("is_start") is False, str(last))
+
+        r = run_ctx(["--dir", str(proj_s), "--resume", sid_a],
+                    stdin="TOUCHSTONE-SESS2\n/q\n", home=shome)
+        check("resume by id: picks named session",
+              f"resumed session {sid_a}" in r.stdout, r.stdout[-400:])
+        last = server.entries[-1] if server.entries else {}
+        check("resume by id: reuses stored conversation id",
+              last.get("conversation_id") == conv_a, str(last))
+
+        r = run_ctx(["--dir", str(proj_s), "--resume", sid_a],
+                    stdin="/sessions\n/q\n", home=shome)
+        check("sessions: list shows ids and model",
+              sid_a in r.stdout and sid_b in r.stdout and "gpt-5.6" in r.stdout,
+              r.stdout[-600:])
+        check("sessions: list marks current", "<- current" in r.stdout, r.stdout[-600:])
+
+        r = run_ctx(["--dir", str(proj_s), "--resume", sid_a],
+                    stdin="TOUCHSTONE-SESS3\n/clear\nTOUCHSTONE-SESS4\n/q\n", home=shome)
+        check("clear: reset message", "conversation reset" in r.stdout, r.stdout[-600:])
+        snap = {}
+        for p in sdir.glob("*.json"):
+            d = json.loads(p.read_text())
+            snap[d["id"]] = d
+        new_ids = set(snap) - {sid_a, sid_b}
+        check("clear: next turn gets a fresh slot", len(new_ids) == 1, str(set(snap)))
+        nid = new_ids.pop() if new_ids else None
+        check("clear: fresh session holds only the new turn",
+              nid and len(snap[nid]["history"]) == 2, str(snap.get(nid))[:200])
+        check("clear: detached from old slot",
+              nid and not any("TOUCHSTONE-SESS4" in h.get("text", "")
+                              for h in snap[sid_a]["history"]))
+
+        r = run_ctx(["--dir", str(proj_s), "--resume", "nope"], stdin="/q\n", home=shome)
+        check("resume: unknown id errors",
+              r.returncode == 1 and "no saved session 'nope'" in r.stderr, r.stderr[-300:])
+        r = run_ctx(["--dir", str(proj_s), "--resume"], stdin="/q\n",
+                    home=tmp / "home-empty-sess")
+        check("resume: no sessions errors",
+              r.returncode == 1 and "no saved sessions" in r.stderr, r.stderr[-300:])
+
+        r = run_ctx(["--dir", str(proj_s), "--resume", "ask", "TOUCHSTONE-SESS2"],
+                    home=shome)
+        check("resume: bare flag before subcommand",
+              r.returncode == 0 and "RESUMED_OK" in r.stdout, r.stdout[-400:])
     finally:
         server.stop()
         shutil.rmtree(tmp, ignore_errors=True)
@@ -591,6 +788,31 @@ def integration_tests_http():
                     new_paths = {e["path"] for e in log[before:]}
                     check("http chat: full-url base not doubled",
                           new_paths == {"/v1/chat/completions"}, str(new_paths))
+
+                    shome = tmp / "home-chat-sess"
+                    proj_s = tmp / "proj-chat-sess"
+                    proj_s.mkdir()
+                    (proj_s / "notes.txt").write_text("alpha bravo charlie\n")
+
+                    def run_sess(args, stdin=None):
+                        return subprocess.run(
+                            [sys.executable, ctx_py] + args, input=stdin,
+                            capture_output=True, text=True,
+                            env=dict(env, CTX_HOME=str(shome)), timeout=90)
+
+                    r = run_sess(["--dir", str(proj_s), "ask",
+                                  "Read notes.txt please. TOUCHSTONE-READ"])
+                    check("http chat: ask saves session",
+                          len(list((shome / "sessions").glob("*.json"))) == 1,
+                          r.stdout[-300:])
+                    before = len(log)
+                    r = run_sess(["--dir", str(proj_s), "--resume"],
+                                 stdin="TOUCHSTONE-SESS2\n/q\n")
+                    check("http chat: resume reply",
+                          "RESUMED_OK" in r.stdout, r.stdout[-400:])
+                    check("http chat: resume sends full history",
+                          log[before:] and all(e.get("hist") for e in log[before:]),
+                          str(log[before:]))
             finally:
                 server.shutdown()
                 server.server_close()

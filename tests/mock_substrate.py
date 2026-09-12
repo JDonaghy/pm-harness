@@ -14,6 +14,7 @@ import json
 import re
 import socket
 import threading
+import urllib.parse
 from pathlib import Path
 
 RS = "\x1e"
@@ -165,8 +166,10 @@ class Conn:
         tone = args.get("tone")
         text = args.get("message", {}).get("text", "")
         is_start = args.get("isStartOfSession")
+        q = urllib.parse.parse_qs(path.split("?", 1)[1]) if "?" in path else {}
         self.server.log({"path": path, "tone": tone, "is_start": is_start,
                          "head": text[:100],
+                         "conversation_id": (q.get("ConversationId") or [""])[0],
                          "agents_md": "USER INSTRUCTIONS" in text,
                          "graph_adv": "KNOWLEDGE GRAPH" in text})
         reply = self.server.script_reply(text, tone)
@@ -239,6 +242,8 @@ def script_reply(text, tone):
         return CONFAB_REPLY
     if "TOUCHSTONE-TONE" in text:
         return f"CURRENT_TONE={tone}"
+    if "TOUCHSTONE-SESS2" in text:
+        return "RESUMED_OK"
     return f"TONE={tone}"
 
 

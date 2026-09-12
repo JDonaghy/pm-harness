@@ -131,6 +131,7 @@ DEFAULT_MODELS = {
 PROVIDERS = ("m365", "chat", "messages", "responses")
 PROVIDER_PATHS = {"chat": "/chat/completions", "messages": "/messages",
                   "responses": "/responses"}
+SUBCOMMANDS = ("login", "logout", "status", "ask")
 
 DEFAULT_CONFIG = {
     "model": "gpt-5.6",
@@ -191,12 +192,14 @@ USAGE = """examples:
   ctx ask "summarize ."  one question, one answer, then exit
 
 session commands:
-  /help /model [name] /add GLOB /drop GLOB /ctx /clear /save [file] /q
+  /help /model [name] /add GLOB /drop GLOB /ctx /graph /issues [id]
+  /clear /save [file] /sessions /q
 
 flags (before the subcommand):
   --model gpt-5.6   pick model for this run (see /model for the list)
   --yes             skip confirmation prompts for write/run tools
   --new             fresh server conversation for every question
+  --resume [id]     continue the most recent (or the given) saved session
   --timeout N       per-request timeout in seconds
 
 environment:
@@ -277,6 +280,7 @@ class Config:
         self.path = self.home / "config.json"
         self.token_path = self.home / "token.json"
         self.transcript_dir = self.home / "transcripts"
+        self.session_dir = self.home / "sessions"
         self.data = dict(DEFAULT_CONFIG)
         if self.path.exists():
             try:
@@ -1500,6 +1504,59 @@ class Session:
         self.turn_count += 1
 
 
+def sanitize_history(raw):
+    if not isinstance(raw, list):
+        return []
+    return [
+        {"role": h["role"], "text": h["text"]}
+        for h in raw
+        if isinstance(h, dict) and h.get("role") in ("user", "assistant", "tool")
+        and isinstance(h.get("text"), str)]
+
+
+def load_session_file(path):
+    try:
+        data = json.loads(path.read_text("utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("history"), list):
+        return None
+    data["history"] = sanitize_history(data["history"])
+    data["id"] = str(data.get("id") or path.stem)
+    return data
+
+
+def find_sessions(cfg):
+    found = []
+    if cfg.session_dir.is_dir():
+        for p in cfg.session_dir.glob("*.json"):
+            data = load_session_file(p)
+            if data and data["history"]:
+                try:
+                    mtime = p.stat().st_mtime_ns
+                except OSError:
+                    mtime = 0
+                found.append((data, mtime))
+    found.sort(key=lambda t: (str(t[0].get("updated") or ""), t[1]), reverse=True)
+    return [d for d, _ in found]
+
+
+def resume_session(cfg, ref):
+    ref = (ref or "").strip()
+    if ref.endswith(".json"):
+        ref = ref[:-5]
+    sessions = find_sessions(cfg)
+    if not sessions:
+        raise CtxError(f"no saved sessions under {cfg.session_dir}")
+    if not ref:
+        return sessions[0]
+    for s in sessions:
+        if s["id"] == ref:
+            return s
+    raise CtxError("no saved session '" + ref + "' - known: "
+                   + ", ".join(s["id"] for s in sessions[:12]))
+
+
 class App:
     def __init__(self, cfg, root, auto_yes=False, verbose=False):
         self.cfg = cfg
@@ -1517,6 +1574,8 @@ class App:
         self.session = None
         self.history = []
         self.rotate_pending = False
+        self.session_slot = None
+        self.session_created = None
 
     @property
     def provider(self):
@@ -1554,6 +1613,63 @@ class App:
     def new_session(self):
         self.session = Session()
         self.rotate_pending = False
+
+    def save_session(self):
+        if not self.history:
+            return None
+        if not self.session_slot:
+            self.session_slot = uuid.uuid4().hex[:8]
+        if not self.session_created:
+            self.session_created = iso_now()
+        data = {
+            "id": self.session_slot,
+            "created": self.session_created,
+            "updated": iso_now(),
+            "model": self.model,
+            "provider": self.provider,
+            "root": str(self.root),
+            "history": self.history,
+        }
+        if self.session and self.provider == "m365":
+            data["conversation_id"] = self.session.conversation_id
+            data["session_id"] = self.session.session_id
+            data["turn_count"] = self.session.turn_count
+        try:
+            self.cfg.session_dir.mkdir(parents=True, exist_ok=True)
+            path = self.cfg.session_dir / (self.session_slot + ".json")
+            path.write_text(json.dumps(data, indent=2) + "\n", "utf-8")
+        except OSError as e:
+            eprint("warning: could not save session: " + str(e))
+            return None
+        return self.session_slot
+
+    def restore_session(self, data):
+        self.history = sanitize_history(data.get("history"))
+        self.session_slot = data.get("id") or None
+        self.session_created = data.get("created") or None
+        model = data.get("model")
+        if isinstance(model, str) and model:
+            if self.provider != "m365":
+                self.model = model
+            else:
+                try:
+                    self.cfg.model_tone(model)
+                    self.model = model
+                except CtxError:
+                    pass
+        if self.provider == "m365" and isinstance(data.get("conversation_id"), str) \
+                and data["conversation_id"]:
+            s = Session()
+            s.conversation_id = data["conversation_id"]
+            s.session_id = data.get("session_id")
+            if not isinstance(s.session_id, str) or not s.session_id:
+                s.session_id = str(uuid.uuid4())
+            try:
+                s.turn_count = int(data.get("turn_count") or 0)
+            except (TypeError, ValueError):
+                s.turn_count = 0
+            self.session = s
+        return len(self.history)
 
     def chat(self, payload, tone, on_frame=None):
         if self.provider != "m365":
@@ -1654,6 +1770,7 @@ class App:
             result = self.send(payload, tone, quiet=quiet)
             if result.error:
                 self._report_error(result)
+                self.save_session()
                 return
             if result.throttle:
                 cur, mx = result.throttle
@@ -1672,6 +1789,7 @@ class App:
                 self.history.append({"role": "assistant", "text": result.text})
                 if not quiet:
                     print(strip_thinking(result.text) or "(empty response)")
+                self.save_session()
                 return
             self.history.append({"role": "assistant", "text": result.text})
             results = []
@@ -1691,6 +1809,7 @@ class App:
             payload = delta_message(results)
         if not quiet:
             eprint("  reached max tool iterations - ask it to wrap up")
+        self.save_session()
 
     def _call_summary(self, name, args):
         for k in ("path", "filePath", "file", "pattern", "command", "cmd"):
@@ -1723,6 +1842,8 @@ class App:
         self.session = None
         self.history = []
         self.rotate_pending = False
+        self.session_slot = None
+        self.session_created = None
 
     def save_transcript(self, path=None):
         self.cfg.transcript_dir.mkdir(parents=True, exist_ok=True)
@@ -1779,6 +1900,7 @@ HELP_TEXT = """commands:
   /issues [id]       local issue tracker (issues.json)
   /clear             reset conversation and history
   /save [file]       save transcript (default under the config dir)
+  /sessions          list saved sessions (resume with: ctx --resume [id])
   /q                 quit
 anything else is sent to the model."""
 
@@ -1889,13 +2011,29 @@ def repl(app):
             print("detail: /issues <id>")
             continue
         if line == "/clear":
+            slot = app.session_slot
             app.clear()
-            print("conversation reset")
+            note = f" (detached from saved session {slot})" if slot else ""
+            print("conversation reset" + note)
             continue
         if line.startswith("/save"):
             parts = line.split()
             path = app.save_transcript(parts[1] if len(parts) > 1 else None)
             print(f"saved: {path}")
+            continue
+        if line == "/sessions":
+            sessions = find_sessions(app.cfg)
+            if not sessions:
+                print(f"no saved sessions ({app.cfg.session_dir})")
+            else:
+                print(f"{len(sessions)} saved sessions (newest first):")
+                for s in sessions:
+                    cur = ("  <- current" if app.session_slot
+                           and s["id"] == app.session_slot else "")
+                    print(f"  {s['id']}  {s.get('updated') or '?'}  "
+                          f"{s.get('model') or '?'}  {s.get('provider') or '?'}  "
+                          f"{len(s['history'])} msgs  {s.get('root') or '?'}{cur}")
+                print("resume with: ctx --resume [id]")
             continue
         if line.startswith("/"):
             print("unknown command - /help")
@@ -1908,6 +2046,22 @@ def repl(app):
             print("\n(interrupted)")
 
 
+def normalize_resume_argv(argv):
+    out = []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--resume":
+            nxt = argv[i + 1] if i + 1 < len(argv) else ""
+            if not nxt or nxt.startswith("-") or nxt in SUBCOMMANDS:
+                out.append("--resume=")
+                i += 1
+                continue
+        out.append(tok)
+        i += 1
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog=PROG, epilog=USAGE,
@@ -1917,6 +2071,8 @@ def main():
     parser.add_argument("--model", help="model name for this run")
     parser.add_argument("--yes", action="store_true", help="skip write/run confirmations")
     parser.add_argument("--new", action="store_true", help="fresh conversation for every question")
+    parser.add_argument("--resume", nargs="?", const="", default=None, metavar="ID",
+                        help="continue the most recent (or the given) saved session")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--timeout", type=int, help="per-request timeout in seconds")
     sub = parser.add_subparsers(dest="cmd")
@@ -1927,7 +2083,7 @@ def main():
     sub.add_parser("status", help="show config and token status")
     p_ask = sub.add_parser("ask", help="ask one question and exit")
     p_ask.add_argument("question", nargs="+", help="the question")
-    args = parser.parse_args()
+    args = parser.parse_args(normalize_resume_argv(sys.argv[1:]))
 
     home = Path(os.environ.get("CTX_HOME") or DEFAULT_HOME)
     cfg = Config(home)
@@ -1956,6 +2112,14 @@ def main():
     app = App(cfg, root, auto_yes=auto_yes, verbose=args.verbose)
     if args.new:
         app.rotate_pending = True
+    if args.resume is not None:
+        try:
+            data = resume_session(cfg, args.resume)
+        except CtxError as e:
+            eprint(f"error: {e}")
+            sys.exit(1)
+        restored = app.restore_session(data)
+        print(f"resumed session {data['id']} ({restored} messages, model {app.model})")
 
     if args.cmd == "ask":
         question = " ".join(args.question)

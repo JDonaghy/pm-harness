@@ -1927,9 +1927,40 @@ class App:
 
     def reauth(self, err):
         """Re-capture a dead token without losing the turn in flight."""
+        if not self.capture_fresh(f"\n  token rejected: {str(err).splitlines()[0]}"):
+            return False
+        print("  retrying the turn\n")
+        return True
+
+    def token_seconds_left(self):
+        data = self.store.load()
+        if not data:
+            return None
+        return int(data.get("expires_at", 0) - time.time())
+
+    def check_token(self, margin=300):
+        """Offer a refresh at startup rather than failing part way into a task."""
+        if self.provider != "m365":
+            return
+        left = self.token_seconds_left()
+        if left is None:
+            return
+        if left > margin:
+            print(f"token: {left // 60} min left")
+            return
+        if left <= 0:
+            lead = "  the token has expired."
+        elif left < 60:
+            lead = "  the token expires in under a minute."
+        else:
+            lead = f"  the token expires in {left // 60} min."
+        if not self.capture_fresh(lead + " only the token needs refreshing -"):
+            print("  carrying on - it will ask again when a request fails")
+
+    def capture_fresh(self, lead):
         if not sys.stdin.isatty():
             return False
-        print(f"\n  token rejected: {str(err).splitlines()[0]}")
+        print(lead)
         print("  reload the Copilot tab, then devtools -> Network ->")
         print(f"  {SOCKET_FILTER} -> right-click Chathub -> Copy link address")
         try:
@@ -1957,7 +1988,6 @@ class App:
         except CtxError as exc:
             print(f"  still not usable: {exc}")
             return False
-        print("  retrying the turn\n")
         return True
 
     def _send_http(self, quiet):
@@ -2925,11 +2955,9 @@ def repl(app):
     print(f"model: {app.model}   files: {nfiles}   dir: {app.root}")
     if app.provider == "m365":
         try:
-            data = app.store.load()
-            if data and data.get("expires_at", 0) < time.time():
-                print("note: token expired - run ctx setup if requests fail")
-        except Exception:
-            pass
+            app.check_token()
+        except CtxError as exc:
+            print(f"note: {exc}")
     maybe_suggest_graph(app)
     print("type /help for commands\n")
     while True:

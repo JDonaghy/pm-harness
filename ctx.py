@@ -234,6 +234,8 @@ environment:
 
 extras:
   AGENTS.md in the project root or the config dir is prepended to every prompt
+  In the repl, a line starting with ! runs as a shell command in the project
+  directory, with no confirmation and without being sent to the model.
   (project file is git-ignored by convention). If graphify-out/graph.json exists,
   the agent gains graph_query / graph_path / graph_explain tools backed by the
   graphify CLI. CTX_GRAPHIFY_CMD overrides how that CLI is invoked.
@@ -2648,6 +2650,7 @@ HELP_TEXT = """commands:
   /clear             reset conversation and history
   /save [file]       save transcript (default under the config dir)
   /sessions          list saved sessions (resume with: ctx --resume [id])
+  !COMMAND           run a shell command here (not sent to the model)
   /q                 quit
 anything else is sent to the model."""
 
@@ -2840,6 +2843,33 @@ def setup_readline(cfg):
     atexit.register(save)
 
 
+SHELL_TIMEOUT = 300
+
+
+def run_shell(app, command):
+    """A ! line is the user's own command - run it, do not ask, do not send it."""
+    command = command.strip()
+    if not command:
+        print("usage: !COMMAND   (runs in " + str(app.root) + ")")
+        return
+    # the child writes straight to the fd, so flush first or output interleaves
+    sys.stdout.flush()
+    try:
+        proc = subprocess.run(command, shell=True, cwd=str(app.root),
+                              timeout=SHELL_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        print(f"  timed out after {SHELL_TIMEOUT}s")
+        return
+    except KeyboardInterrupt:
+        print("\n  interrupted")
+        return
+    except OSError as exc:
+        print(f"  {exc}")
+        return
+    if proc.returncode:
+        print(f"  exit={proc.returncode}")
+
+
 def throttle_label(app):
     """The backend reports turns used per conversation - show it."""
     throttle = getattr(app, "throttle", None)
@@ -2879,6 +2909,9 @@ def repl(app):
             return
         if line == "/help":
             print(HELP_TEXT)
+            continue
+        if line.startswith("!"):
+            run_shell(app, line[1:])
             continue
         if line.startswith("/model"):
             parts = line.split()

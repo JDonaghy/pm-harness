@@ -11,11 +11,13 @@ outside the project directory and the config directory.
 """
 
 import argparse
+import atexit
 import base64
 import copy
 import difflib
 import fnmatch
 import getpass
+import glob as globmod
 import json
 import os
 import re
@@ -1353,7 +1355,7 @@ class ToolBox:
         except re.error as e:
             return f"ERROR: bad regex: {e}"
         matches = []
-        for f in walk_files(self.root):
+        for f in walk_files(self.app.root):
             rel = str(f.relative_to(self.app.root))
             if not (fnmatch.fnmatch(rel, glob) or fnmatch.fnmatch(f.name, glob)):
                 continue
@@ -2687,6 +2689,62 @@ def maybe_suggest_graph(app):
     remember_graph_hint(cfg, app.root)
 
 
+try:
+    import readline          # line editing and history for input()
+except ImportError:          # some minimal windows builds ship without it
+    readline = None
+
+HISTORY_LENGTH = 2000
+
+
+def repl_command_names():
+    """The slash commands, taken from the help text so they cannot drift."""
+    return sorted({line.strip().split()[0] for line in HELP_TEXT.splitlines()
+                   if line.strip().startswith("/")})
+
+
+def make_completer(commands):
+    def complete(text, state):
+        if text.startswith("/"):
+            options = [name + " " for name in commands if name.startswith(text)]
+        else:
+            options = [path + ("/" if os.path.isdir(path) else " ")
+                       for path in sorted(globmod.glob(text + "*"))]
+        return options[state] if state < len(options) else None
+    return complete
+
+
+def setup_readline(cfg):
+    """Arrow keys, history and tab completion in the repl."""
+    if readline is None:
+        return
+    path = Path(cfg.home) / "history"
+    try:
+        readline.read_history_file(str(path))
+    except (OSError, ValueError):
+        pass
+    try:
+        readline.set_history_length(HISTORY_LENGTH)
+        readline.set_completer(make_completer(repl_command_names()))
+        readline.set_completer_delims(" \t\n")
+        # libedit on macos takes a different bind syntax than gnu readline
+        if "libedit" in (getattr(readline, "__doc__", "") or ""):
+            readline.parse_and_bind("bind ^I rl_complete")
+        else:
+            readline.parse_and_bind("tab: complete")
+    except Exception:
+        pass
+
+    def save():
+        try:
+            Path(cfg.home).mkdir(parents=True, exist_ok=True)
+            readline.write_history_file(str(path))
+        except (OSError, ValueError):
+            pass
+
+    atexit.register(save)
+
+
 def throttle_label(app):
     """The backend reports turns used per conversation - show it."""
     throttle = getattr(app, "throttle", None)
@@ -2699,6 +2757,7 @@ def throttle_label(app):
 
 
 def repl(app):
+    setup_readline(app.cfg)
     nfiles, _ = app.ctx.stats()
     print(f"model: {app.model}   files: {nfiles}   dir: {app.root}")
     if app.provider == "m365":

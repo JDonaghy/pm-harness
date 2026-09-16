@@ -148,6 +148,8 @@ DEFAULT_CONFIG = {
     "api_key": "",
     "max_tokens": 8192,
     "graphify_cmd": "",
+    "license_type": "Starter",
+    "web_search": True,
 }
 
 SKIP_DIRS = {
@@ -192,6 +194,7 @@ USAGE = """examples:
   ctx login --paste      auth by pasting a token from browser devtools
                          (works around conditional access blocks)
   ctx status             token expiry, model, config location
+  ctx probe              find a chat frame the backend accepts
   ctx                    interactive session in the current folder
   ctx ask "summarize ."  one question, one answer, then exit
 
@@ -302,6 +305,10 @@ class Config:
                          ("CTX_API_KEY", "api_key"), ("CTX_GRAPHIFY_CMD", "graphify_cmd")):
             if os.environ.get(var):
                 self.data[key] = os.environ[var]
+        if os.environ.get("CTX_LICENSE_TYPE"):
+            self.data["license_type"] = os.environ["CTX_LICENSE_TYPE"]
+        if os.environ.get("CTX_WEB_SEARCH"):
+            self.data["web_search"] = os.environ["CTX_WEB_SEARCH"] not in ("0", "false", "no")
         if os.environ.get("CTX_MAX_TOKENS"):
             try:
                 self.data["max_tokens"] = int(os.environ["CTX_MAX_TOKENS"])
@@ -664,7 +671,8 @@ def fold_text(answer, nxt):
     return nxt, None
 
 
-def build_chat_frame(text, tone, session_id, request_id, is_start):
+def build_chat_frame(text, tone, session_id, request_id, is_start,
+                     web_search=True, overrides=None):
     gmtoff = time.localtime().tm_gmtoff or 0
     args = {
         "source": "officeweb",
@@ -707,12 +715,18 @@ def build_chat_frame(text, tone, session_id, request_id, is_start):
             "adaptiveCards": [],
             "clientPreferences": {},
         },
-        "plugins": [{"Id": "BingWebSearch", "Source": "BuiltIn"}],
+        "plugins": ([{"Id": "BingWebSearch", "Source": "BuiltIn"}]
+                    if web_search else []),
         "isSbsSupported": True,
         "tone": tone,
         "renderReferencesBehindEOS": True,
         "disconnectBehavior": "continue",
     }
+    for key, value in (overrides or {}).items():
+        if value is None:
+            args.pop(key, None)
+        else:
+            args[key] = value
     return {"arguments": [args], "invocationId": "0", "target": "chat", "type": 4}
 
 
@@ -743,9 +757,10 @@ def redact_token(url):
 
 
 def chat_once(cfg, token, claims, session, text, tone, timeout_s, on_frame=None,
-              debug=False):
+              debug=False, overrides=None):
+    overrides = overrides or {}
     request_id = str(uuid.uuid4())
-    params = urllib.parse.urlencode({
+    params = {
         "chatsessionid": request_id,
         "clientrequestid": request_id,
         "X-SessionId": session.session_id,
@@ -755,10 +770,16 @@ def chat_once(cfg, token, claims, session, text, tone, timeout_s, on_frame=None,
         "source": '"officeweb"',
         "product": "Office",
         "agentHost": "Bizchat.FullScreen",
-        "licenseType": "Starter",
+        "licenseType": cfg.data.get("license_type") or "Starter",
         "agent": "web",
         "scenario": "OfficeWebIncludedCopilot",
-    })
+    }
+    for key, value in (overrides.get("query") or {}).items():
+        if value is None:
+            params.pop(key, None)
+        else:
+            params[key] = value
+    params = urllib.parse.urlencode({k: v for k, v in params.items() if v != ""})
     url = f"{cfg.data['ws_base']}/{claims['oid']}@{claims['tid']}?{params}"
     if debug:
         eprint("  -> ws " + redact_token(url))
@@ -785,7 +806,9 @@ def chat_once(cfg, token, claims, session, text, tone, timeout_s, on_frame=None,
                 return TurnResult(error="handshake error: " + str(frame["error"]))
         ws.send_text(json.dumps({"type": 6}) + RS)
         chat = build_chat_frame(text, tone, session.session_id, request_id,
-                                session.turn_count == 0)
+                                session.turn_count == 0,
+                                web_search=bool(cfg.data.get("web_search", True)),
+                                overrides=overrides.get("frame"))
         if debug:
             probe = copy.deepcopy(chat)
             probe["arguments"][0]["message"]["text"] = f"<{len(text)} chars>"
@@ -1920,6 +1943,60 @@ def cmd_logout(args, cfg):
     print("token removed")
 
 
+PROBE_CASES = [
+    ("baseline (current config)", {}, None),
+    ("web search off", {"frame": {"plugins": []}},
+     '"web_search": false'),
+    ("licenseType omitted", {"query": {"licenseType": None}},
+     '"license_type": ""'),
+    ("licenseType Enterprise", {"query": {"licenseType": "Enterprise"}},
+     '"license_type": "Enterprise"'),
+    ("no variants", {"query": {"variants": ""}},
+     "clear the VARIANTS list at the top of ctx.py"),
+    ("web search off + licenseType omitted",
+     {"frame": {"plugins": []}, "query": {"licenseType": None}},
+     '"web_search": false and "license_type": ""'),
+    ("tone Gpt_Quick", {"tone": "Gpt_Quick"},
+     '"model": "quick"'),
+    ("tone Gpt_Quick + web search off",
+     {"tone": "Gpt_Quick", "frame": {"plugins": []}},
+     '"model": "quick" and "web_search": false'),
+]
+
+
+def cmd_probe(args, cfg):
+    if cfg.data.get("provider", "m365") != "m365":
+        raise CtxError("probe only applies to the m365 provider")
+    store = TokenStore(cfg)
+    data = store.acquire()
+    token = data["access_token"]
+    claims = data.get("claims") or jwt_decode(token)
+    if not claims.get("oid") or not claims.get("tid"):
+        raise CtxError("token missing oid/tid claims - re-login with: ctx login")
+    base_tone = cfg.model_tone(cfg.data["model"])
+    timeout = min(int(cfg.data["turn_timeout_s"]), 90)
+    print(f"probing {cfg.data['ws_base']} with a one-word message")
+    print(f"  model {cfg.data['model']} -> tone {base_tone}\n")
+    for name, over, hint in PROBE_CASES:
+        tone = over.get("tone", base_tone)
+        result = chat_once(cfg, token, claims, Session(), "hi", tone, timeout,
+                           debug=args.verbose, overrides=over)
+        if result.error:
+            print(f"  [fail] {name}: {result.error}")
+            continue
+        if not result.text.strip():
+            print(f"  [fail] {name}: accepted but returned no text")
+            continue
+        print(f"  [ OK ] {name}: {result.text.strip()[:60]}")
+        print(f"\nthat one works. to make it permanent, set {hint or 'nothing'}")
+        if hint:
+            print(f"  in {cfg.path}")
+        return
+    print("\nnothing worked - the rejected field is something else in the frame.")
+    print("run: ctx --verbose probe   and diff the '-> ws' and '-> chat' lines")
+    print("against the browser's own websocket request.")
+
+
 def cmd_status(args, cfg):
     data = TokenStore(cfg).load()
     print(f"config   : {cfg.path}")
@@ -1930,6 +2007,9 @@ def cmd_status(args, cfg):
         print(f"provider : {provider}   base: {cfg.data.get('base_url') or '(unset)'}")
         print(f"api key  : {'set' if cfg.data.get('api_key') else '(unset)'}")
     print(f"model    : {cfg.data['model']}")
+    if provider == "m365":
+        print(f"license  : {cfg.data.get('license_type') or '(omitted)'}")
+        print(f"websearch: {'on' if cfg.data.get('web_search', True) else 'off'}")
     if provider != "m365":
         return
     if data is None:
@@ -2141,6 +2221,8 @@ def main():
                               "(works around conditional access blocks)")
     sub.add_parser("logout", help="remove the stored token")
     sub.add_parser("status", help="show config and token status")
+    sub.add_parser("probe", help="find a chat frame the backend accepts "
+                                 "(use after an InvalidRequest)")
     p_ask = sub.add_parser("ask", help="ask one question and exit")
     p_ask.add_argument("question", nargs="+", help="the question")
     args = parser.parse_args(normalize_resume_argv(sys.argv[1:]))
@@ -2156,6 +2238,9 @@ def main():
     if args.cmd == "logout":
         cmd_logout(args, cfg)
         return
+    if args.cmd == "probe":
+        cmd_probe(args, cfg)
+        return 0
     if args.cmd == "status":
         cmd_status(args, cfg)
         return

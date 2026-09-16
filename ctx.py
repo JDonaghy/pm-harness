@@ -1845,6 +1845,14 @@ class App:
     def send(self, payload, tone, quiet=False):
         if self.provider != "m365":
             return self._send_http(quiet)
+        result = self._send_m365(payload, tone, quiet)
+        # The token lasts about an hour and cannot be refreshed, so it dies
+        # mid-task. Re-capture and retry rather than losing the turn.
+        if result.error and is_auth_error(result.error) and self.reauth(result.error):
+            result = self._send_m365(payload, tone, quiet)
+        return result
+
+    def _send_m365(self, payload, tone, quiet):
         state = {"last": time.monotonic(), "any": False}
 
         def on_frame():
@@ -1856,10 +1864,48 @@ class App:
                 state["last"] = now
                 state["any"] = True
 
-        result = self.chat(payload, tone, on_frame=on_frame)
+        try:
+            result = self.chat(payload, tone, on_frame=on_frame)
+        except CtxError as exc:
+            result = TurnResult(error=str(exc))
         if state["any"]:
             print()
         return result
+
+    def reauth(self, err):
+        """Re-capture a dead token without losing the turn in flight."""
+        if not sys.stdin.isatty():
+            return False
+        print(f"\n  token rejected: {str(err).splitlines()[0]}")
+        print("  reload the Copilot tab, then devtools -> Network ->")
+        print(f"  {SOCKET_FILTER} -> right-click Chathub -> Copy link address")
+        try:
+            answer = input("  Enter once copied, or s to skip: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return False
+        if answer.startswith("s"):
+            return False
+        try:
+            raw = read_clipboard()
+        except CtxError as exc:
+            print(f"  {exc}")
+            return False
+        kind = sniff_capture(raw)
+        if kind == "url":
+            adopt_url(raw, self.cfg, quiet=True)
+        elif kind == "token":
+            adopt_token(self.cfg, raw)
+        else:
+            print(f"  the clipboard holds neither a url nor a token ({kind})")
+            return False
+        try:
+            self.creds()
+        except CtxError as exc:
+            print(f"  still not usable: {exc}")
+            return False
+        print("  retrying the turn\n")
+        return True
 
     def _send_http(self, quiet):
         state = {"any": False}
@@ -2178,6 +2224,15 @@ SETUP_STEPS = {
 }
 
 
+AUTH_ERROR_MARKERS = ("401", "unauthorized", "invalid_token", "invalidtoken",
+                      "token expired", "not set up yet", "not logged in")
+
+
+def is_auth_error(text):
+    low = str(text).lower()
+    return any(marker in low for marker in AUTH_ERROR_MARKERS)
+
+
 def sniff_capture(value):
     """Work out which of the two captures the clipboard is holding."""
     text = value.strip().strip(RS).strip()
@@ -2253,7 +2308,7 @@ def cmd_adopt(args, cfg):
     print("\nnow run: ctx probe")
 
 
-def adopt_url(raw, cfg):
+def adopt_url(raw, cfg, quiet=False):
     if not raw:
         raise CtxError("empty url")
     parts = urllib.parse.urlsplit(raw)
@@ -2272,6 +2327,11 @@ def adopt_url(raw, cfg):
     cfg.data["ws_params"] = adopted
     cfg.save()
 
+    if quiet:
+        token = dict(pairs).get("access_token")
+        if token:
+            adopt_token(cfg, token)
+        return len(adopted)
     print(f"\n  ws base : {cfg.data['ws_base']}")
     if cfg.data["ws_base"] != WS_BASE_DEFAULT:
         print(f"  (was    : {WS_BASE_DEFAULT})")

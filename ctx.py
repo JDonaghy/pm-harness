@@ -12,6 +12,7 @@ outside the project directory and the config directory.
 
 import argparse
 import base64
+import copy
 import difflib
 import fnmatch
 import getpass
@@ -737,6 +738,10 @@ class TurnResult:
         self.message_type = message_type
 
 
+def redact_token(url):
+    return re.sub(r"(access_token=)[^&]*", r"\1<redacted>", url)
+
+
 def chat_once(cfg, token, claims, session, text, tone, timeout_s, on_frame=None,
               debug=False):
     request_id = str(uuid.uuid4())
@@ -755,6 +760,8 @@ def chat_once(cfg, token, claims, session, text, tone, timeout_s, on_frame=None,
         "scenario": "OfficeWebIncludedCopilot",
     })
     url = f"{cfg.data['ws_base']}/{claims['oid']}@{claims['tid']}?{params}"
+    if debug:
+        eprint("  -> ws " + redact_token(url))
     ws = WebSocketClient(url, headers=WS_HEADERS, sock_timeout=30)
     answer = ""
     throttle = None
@@ -779,6 +786,10 @@ def chat_once(cfg, token, claims, session, text, tone, timeout_s, on_frame=None,
         ws.send_text(json.dumps({"type": 6}) + RS)
         chat = build_chat_frame(text, tone, session.session_id, request_id,
                                 session.turn_count == 0)
+        if debug:
+            probe = copy.deepcopy(chat)
+            probe["arguments"][0]["message"]["text"] = f"<{len(text)} chars>"
+            eprint("  -> chat " + json.dumps(probe)[:DEBUG_FRAME_CHARS])
         ws.send_text(json.dumps(chat) + RS + json.dumps(build_metrics_frame()) + RS)
         while True:
             raw = ws.recv_text(deadline)
@@ -813,6 +824,13 @@ def chat_once(cfg, token, claims, session, text, tone, timeout_s, on_frame=None,
                     if thr:
                         throttle = (thr.get("numUserMessagesInConversation"),
                                     thr.get("maxNumUserMessagesInConversation"))
+                    res = item.get("result") or {}
+                    value = res.get("value")
+                    if value and value != "Success":
+                        detail = str(res.get("message") or "").strip()
+                        err = f"{value}: {detail}" if detail else str(value)
+                        return TurnResult(error=err, throttle=throttle,
+                                          message_type=last_message_type)
                     for m in item.get("messages") or []:
                         if m.get("author") == "bot":
                             if m.get("messageType"):
@@ -1857,6 +1875,11 @@ class App:
             print("  try: /drop to shrink context, /clear, or /model")
         elif "Failed to invoke" in err:
             print(f"  the tone '{self.cfg.model_tone(self.model)}' may be unavailable - try /model")
+        elif "InvalidRequest" in err:
+            print("  the backend rejected the chat frame itself, not the token")
+            print("  compare ctx --verbose's '-> ws' and '-> chat' lines against the")
+            print("  browser's own websocket request (devtools -> Network -> WS)")
+            print("  likely suspects: tone (/model), licenseType, variants")
         elif "401" in err or "nauthorized" in err:
             print("  run: ctx login (m365) or check CTX_API_KEY (http provider)")
 

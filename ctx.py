@@ -201,6 +201,7 @@ CONFAB_PATTERNS = [
 
 USAGE = """examples:
   ctx login              first-time auth (device code shown for the host browser)
+  ctx setup              guided first-time setup (start here)
   ctx login --paste      auth by pasting a token from browser devtools
                          (works around conditional access blocks)
   ctx status             token expiry, model, config location
@@ -428,7 +429,7 @@ class TokenStore:
     def acquire(self):
         data = self.load()
         if data is None:
-            raise CtxError("not logged in - run: ctx login")
+            raise CtxError("not set up yet - run: ctx setup")
         if data.get("expires_at", 0) - 90 > time.time():
             return data
         if data.get("from_env"):
@@ -516,8 +517,9 @@ def device_login(store):
 
 def paste_login(store, args=None):
     print("Paste the access token (audience https://substrate.office.com/sydney).")
-    print("In the browser: m365.cloud.microsoft/chat -> devtools -> Network -> WS ->")
-    print("the Chathub row -> Headers -> Request URL -> its access_token parameter.")
+    print("In the browser: m365.cloud.microsoft/chat -> devtools -> Network ->")
+    print(f"{SOCKET_FILTER} -> the Chathub row -> Headers -> Request URL ->")
+    print("its access_token parameter.")
     print("Or copy the whole url and run: ctx login --paste --clipboard")
     token = read_long_input(args or argparse.Namespace(), "token: ")
     if token.startswith(("ws", "http")) and "access_token=" in token:
@@ -1975,7 +1977,7 @@ class App:
         elif "InvalidRequest" in err:
             print("  the backend rejected the chat frame itself, not the token")
             print("  compare ctx --verbose's '-> ws' and '-> chat' lines against the")
-            print("  browser's own websocket request (devtools -> Network -> WS)")
+            print(f"  browser's own request (devtools -> Network -> {SOCKET_FILTER})")
             print("  likely suspects: tone (/model), licenseType, variants")
         elif "401" in err or "nauthorized" in err:
             print("  run: ctx login (m365) or check CTX_API_KEY (http provider)")
@@ -2016,6 +2018,9 @@ def cmd_logout(args, cfg):
     TokenStore(cfg).clear()
     print("token removed")
 
+
+# Chrome renamed the websocket request filter from "WS" to "Socket"
+SOCKET_FILTER = 'Socket (called "WS" in older Chrome)'
 
 TTY_LINE_LIMIT = 4096
 
@@ -2075,7 +2080,17 @@ def shorten(value, width=52):
     return text if len(text) <= width else text[: width - 3] + "..."
 
 
+def normalise_for_diff(args):
+    """Drop the fields ctx rewrites each turn, so only real drift shows."""
+    out = copy.deepcopy(args)
+    client = out.get("clientInfo")
+    if isinstance(client, dict):
+        client.pop("clientSessionId", None)
+    return out
+
+
 def diff_frames(browser, ours):
+    browser, ours = normalise_for_diff(browser), normalise_for_diff(ours)
     lines = []
     for key in sorted(set(browser) - set(ours)):
         lines.append(f"  + {key} = {shorten(browser[key])}")
@@ -2109,10 +2124,14 @@ def parse_chat_frame(raw):
 
 
 def adopt_frame(args, cfg):
-    print("In devtools: Network -> WS -> the Chathub row -> Messages tab.")
+    print(f"In devtools: Network -> {SOCKET_FILTER} -> the Chathub row -> Messages.")
     print('Find the outgoing (green) message containing "target":"chat" -')
     print("right-click it -> Copy message. Then rerun with --clipboard.")
-    theirs = parse_chat_frame(read_long_input(args, "frame: "))
+    adopt_frame_value(read_long_input(args, "frame: "), cfg)
+
+
+def adopt_frame_value(raw, cfg):
+    theirs = parse_chat_frame(raw)
     ours = build_chat_frame("hi", cfg.model_tone(cfg.data["model"]),
                             "SID", "RID", True,
                             web_search=bool(cfg.data.get("web_search", True)))["arguments"][0]
@@ -2136,7 +2155,81 @@ def adopt_frame(args, cfg):
             print("  if that thread fills up or starts refusing turns.")
     print(f"\n  frame saved as a template ({len(stored)} fields) to {cfg.path}")
     print("  the message text and the ids in PER_TURN_FRAME are filled in per turn")
-    print("\nnow run: ctx probe")
+
+
+SETUP_INTRO = """ctx setup - copies what the browser sends so ctx can send the same.
+
+In Chrome:
+  1. open https://m365.cloud.microsoft/chat and sign in
+  2. open devtools with F12, then the Network tab
+  3. click the {socket} filter
+  4. reload the page, then send any message in the chat
+
+That leaves one row named Chathub. Both things below come from it.
+Nothing leaves this machine - ctx only reads your clipboard."""
+
+SETUP_STEPS = {
+    "url": ("the connection url",
+            "  right-click the Chathub row -> Copy -> Copy link address"),
+    "frame": ("the outgoing chat message",
+              "  click the Chathub row -> Messages tab -> find the outgoing\n"
+              '  (green) message containing "target":"chat" -> right-click\n'
+              "  -> Copy message"),
+}
+
+
+def sniff_capture(value):
+    """Work out which of the two captures the clipboard is holding."""
+    text = value.strip().strip(RS).strip()
+    if text[:1] == "{":
+        return "frame"
+    if text.lower().startswith(("ws://", "wss://", "http://", "https://")):
+        return "url"
+    if text.startswith("eyJ") and text.count(".") == 2:
+        return "token"
+    return "unknown"
+
+
+def cmd_setup(args, cfg):
+    if cfg.data.get("provider", "m365") != "m365":
+        raise CtxError("setup only applies to the m365 provider")
+    print(SETUP_INTRO.format(socket=SOCKET_FILTER))
+    need = ["url", "frame"]
+    while need:
+        label, how = SETUP_STEPS[need[0]]
+        print(f"\n[{3 - len(need)}/2] copy {label}:")
+        print(how)
+        try:
+            input("\n  press Enter once it is copied (ctrl-c to stop): ")
+        except EOFError:
+            raise CtxError("setup needs an interactive terminal")
+        try:
+            raw = read_clipboard()
+        except CtxError as exc:
+            print(f"  {exc}")
+            continue
+        kind = sniff_capture(raw)
+        if kind == "token":
+            print("  that is the token on its own, not the whole url - saving it,")
+            print("  but still copy the url with Copy link address.")
+            adopt_token(cfg, raw)
+            continue
+        if kind == "unknown":
+            print(f"  the clipboard holds {len(raw)} chars starting {raw[:32]!r}")
+            print("  that is neither a url nor a json message - try copying again")
+            continue
+        if kind not in need:
+            print(f"  that is the {SETUP_STEPS[kind][0]}, which is already captured")
+            print(f"  still needed: {SETUP_STEPS[need[0]][0]}")
+            continue
+        print()
+        if kind == "url":
+            adopt_url(raw, cfg)
+        else:
+            adopt_frame_value(raw, cfg)
+        need.remove(kind)
+    print("\n[2/2] captured. checking the backend accepts it...\n")
+    cmd_probe(args, cfg)
 
 
 def cmd_adopt(args, cfg):
@@ -2153,10 +2246,14 @@ def cmd_adopt(args, cfg):
     if getattr(args, "frame", False):
         adopt_frame(args, cfg)
         return
-    print("In the browser: m365.cloud.microsoft/chat -> devtools -> Network -> WS ->")
-    print("right-click the Chathub row -> Copy -> Copy link address.")
+    print("In the browser: m365.cloud.microsoft/chat -> devtools -> Network ->")
+    print(f"{SOCKET_FILTER} -> right-click the Chathub row -> Copy -> Copy link address.")
     print("Then: ctx adopt --clipboard   (the url is too long to paste into a terminal)")
-    raw = read_long_input(args, "url: ")
+    adopt_url(read_long_input(args, "url: "), cfg)
+    print("\nnow run: ctx probe")
+
+
+def adopt_url(raw, cfg):
     if not raw:
         raise CtxError("empty url")
     parts = urllib.parse.urlsplit(raw)
@@ -2199,7 +2296,7 @@ def cmd_adopt(args, cfg):
     token = dict(pairs).get("access_token")
     if token:
         adopt_token(cfg, token)
-    print("\nnow run: ctx probe")
+    return len(adopted)
 
 
 def adopt_token(cfg, token):
@@ -2554,8 +2651,8 @@ def main():
         epilog="conditional access can block the device code flow: the browser says "
                "the sign-in does not meet the criteria to access this resource. "
                "remedy: sign in at m365.cloud.microsoft/chat, then devtools -> "
-               "Network -> WS -> substrate.office.com frame url, copy its "
-               "access_token query parameter and run: ctx login --paste")
+               "Network -> Socket (called WS in older Chrome) -> the Chathub "
+               "row -> Headers -> Request URL. easier: ctx setup")
     p_login.add_argument("--clipboard", action="store_true",
                          help="read from the clipboard instead of a terminal paste")
     p_login.add_argument("--file", help="read from a file instead of a terminal paste")
@@ -2563,6 +2660,7 @@ def main():
                          help="paste a token from browser devtools instead "
                               "(works around conditional access blocks)")
     sub.add_parser("logout", help="remove the stored token")
+    sub.add_parser("setup", help="guided first-time setup (start here)")
     sub.add_parser("status", help="show config and token status")
     sub.add_parser("probe", help="find a chat frame the backend accepts "
                                  "(use after an InvalidRequest)")
@@ -2592,6 +2690,9 @@ def main():
     if args.cmd == "logout":
         cmd_logout(args, cfg)
         return
+    if args.cmd == "setup":
+        cmd_setup(args, cfg)
+        return 0
     if args.cmd == "adopt":
         cmd_adopt(args, cfg)
         return 0

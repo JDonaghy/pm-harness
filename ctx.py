@@ -2122,15 +2122,27 @@ def adopt_token(cfg, token):
               f"{(int(time.time()) - exp) // 60} min ago")
         print(keep + " - get a fresh one with: ctx login --paste")
         return
+    aud = str(claims.get("aud") or "")
+    if "substrate.office.com" not in aud:
+        print(f"  warning: url token audience is {aud or '(none)'} - "
+              "expected substrate.office.com")
     store = TokenStore(cfg)
     existing = store.load()
-    if existing and int(existing.get("expires_at") or 0) > time.time() \
-            and existing.get("access_token") != token:
-        print("  stored token is still valid, so the url's token was left alone")
+    if existing and existing.get("access_token") == token:
+        print("  access_token in the url is the one already stored")
+        return
+    # A freshly captured url token beats the stored one unless the stored one
+    # genuinely outlives it - a truncated paste still reports a future exp.
+    existing_exp = int((existing or {}).get("expires_at") or 0)
+    if existing and existing_exp > exp:
+        print(f"  stored token outlives the url's by "
+              f"{(existing_exp - exp) // 60} min, so it was kept")
+        print("  to use the url's anyway: ctx logout && ctx adopt --clipboard")
         return
     store.save(token, None, exp, claims)
-    print(f"  access_token from the url saved "
-          f"({(exp - int(time.time())) // 60} min remaining)")
+    note = "" if not existing else " (replacing the stored one)"
+    print(f"  access_token from the url saved{note}: {len(token)} chars, "
+          f"{(exp - int(time.time())) // 60} min remaining")
 
 
 PREVIOUS_PARAM_KEYS = {
@@ -2222,7 +2234,16 @@ def cmd_status(args, cfg):
     remaining = int(data.get("expires_at", 0) - time.time())
     state = "valid" if remaining > 0 else "EXPIRED"
     print(f"account  : {data.get('account') or claims.get('preferred_username') or '?'}")
-    print(f"token    : {state} ({remaining // 60} min remaining)")
+    token = data.get("access_token") or ""
+    print(f"token    : {state} ({remaining // 60} min remaining, {len(token)} chars)")
+    sig = token.split(".")[-1] if token.count(".") == 2 else ""
+    if len(sig) < 40:
+        print(f"  WARNING: signature is only {len(sig)} chars - this token is")
+        print("  truncated and the server will reject it with invalid_token.")
+        print("  re-capture it with: ctx login --paste --clipboard")
+    if len(token) in (TTY_LINE_LIMIT - 1, TTY_LINE_LIMIT):
+        print(f"  WARNING: exactly {len(token)} chars - cut off by the terminal's")
+        print("  paste limit. re-capture with: ctx login --paste --clipboard")
     print(f"refresh  : {'yes' if data.get('refresh_token') else 'no'}")
 
 

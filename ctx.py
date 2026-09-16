@@ -2128,6 +2128,12 @@ def adopt_frame(args, cfg):
         message["text"] = ""
     cfg.data["frame_template"] = stored
     cfg.save()
+    for key in ("conversationId", "conversationSignature", "threadId"):
+        if stored.get(key):
+            print(f"\n  note: the captured frame carries {key}={shorten(stored[key])}")
+            print("  every ctx conversation will reuse it, so turns may land in the")
+            print("  browser's own thread. re-run adopt --frame from a fresh chat")
+            print("  if that thread fills up or starts refusing turns.")
     print(f"\n  frame saved as a template ({len(stored)} fields) to {cfg.path}")
     print("  the message text and the ids in PER_TURN_FRAME are filled in per turn")
     print("\nnow run: ctx probe")
@@ -2304,9 +2310,12 @@ def cmd_probe(args, cfg):
             print(f"  [fail] {name}: accepted but returned no text")
             continue
         print(f"  [ OK ] {name}: {result.text.strip()[:60]}")
-        print(f"\nthat one works. to make it permanent, set {hint or 'nothing'}")
         if hint:
+            print(f"\nthat one works - to keep it, set {hint}")
             print(f"  in {cfg.path}")
+        else:
+            print("\nyour current config works as it stands - nothing to change.")
+            print("  start chatting with: ctx")
         return
     print("\nnothing worked - the rejected field is something else in the frame.")
     print("run: ctx --verbose probe   and diff the '-> ws' and '-> chat' lines")

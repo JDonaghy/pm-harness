@@ -525,6 +525,24 @@ def paste_login(store):
     print("  signed in as: " + (claims.get("preferred_username") or str(claims.get("oid"))))
 
 
+# headers substrate uses to say why it rejected a request
+DIAGNOSTIC_HEADERS = ("x-ms-diagnostics", "www-authenticate", "x-ms-error",
+                      "x-ms-error-code", "x-calculatedbetarget", "x-msedge-ref",
+                      "request-id", "x-ms-request-id")
+
+
+def upgrade_failure_detail(head):
+    lines = head.decode("latin-1", "replace").split("\r\n")[1:]
+    found = []
+    for line in lines:
+        if ":" not in line:
+            continue
+        name, _, value = line.partition(":")
+        if name.strip().lower() in DIAGNOSTIC_HEADERS:
+            found.append(f"\n  {name.strip().lower()}: {value.strip()[:300]}")
+    return "".join(found)
+
+
 class WebSocketClient:
     GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -566,7 +584,8 @@ class WebSocketClient:
         head = self._read_until(b"\r\n\r\n", time.monotonic() + 20)
         status = head.split(b"\r\n", 1)[0].decode("latin-1")
         if " 101 " not in status + " ":
-            raise CtxError(f"websocket upgrade failed: {status.strip()}")
+            raise CtxError("websocket upgrade failed: " + status.strip()
+                           + upgrade_failure_detail(head))
 
     def _pump(self, deadline):
         if deadline is not None and time.monotonic() > deadline:
@@ -1960,6 +1979,12 @@ def cmd_logout(args, cfg):
 def cmd_adopt(args, cfg):
     if cfg.data.get("provider", "m365") != "m365":
         raise CtxError("adopt only applies to the m365 provider")
+    if getattr(args, "reset", False):
+        cfg.data["ws_params"] = {}
+        cfg.data["ws_base"] = WS_BASE_DEFAULT
+        cfg.save()
+        print(f"ws params cleared, ws base back to {WS_BASE_DEFAULT}")
+        return
     print("Paste the browser's websocket url.")
     print("In the browser: m365.cloud.microsoft/chat -> devtools -> Network -> WS ->")
     print("the Chathub row -> Headers -> Request URL (the whole thing).")
@@ -1983,6 +2008,10 @@ def cmd_adopt(args, cfg):
     cfg.save()
 
     print(f"\n  ws base : {cfg.data['ws_base']}")
+    if cfg.data["ws_base"] != WS_BASE_DEFAULT:
+        print(f"  (was    : {WS_BASE_DEFAULT})")
+        print("  ctx appends /<oid>@<tid> to this - if the browser url had no such")
+        print("  segment, that derivation is wrong: ctx adopt --reset")
     old = set(PREVIOUS_PARAM_KEYS)
     for key in sorted(adopted):
         mark = " " if key in old else "+"
@@ -2335,8 +2364,10 @@ def main():
     sub.add_parser("status", help="show config and token status")
     sub.add_parser("probe", help="find a chat frame the backend accepts "
                                  "(use after an InvalidRequest)")
-    sub.add_parser("adopt", help="copy the query parameters from the browser's "
-                                 "own websocket url")
+    p_adopt = sub.add_parser("adopt", help="copy the query parameters from the "
+                                           "browser's own websocket url")
+    p_adopt.add_argument("--reset", action="store_true",
+                         help="discard adopted parameters and use the built-in defaults")
     p_ask = sub.add_parser("ask", help="ask one question and exit")
     p_ask.add_argument("question", nargs="+", help="the question")
     args = parser.parse_args(normalize_resume_argv(sys.argv[1:]))

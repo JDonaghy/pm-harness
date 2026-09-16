@@ -892,6 +892,8 @@ def chat_once(cfg, token, claims, session, text, tone, timeout_s, on_frame=None,
                                 continue
                             if m.get("text"):
                                 answer, _ = fold_text(answer, m["text"])
+    except CtxError as e:
+        return TurnResult(error=str(e))
     except TurnTimeout:
         return TurnResult(error=f"timed out after {timeout_s}s (try --timeout or another model)")
     except WsClosed as e:
@@ -1995,15 +1997,49 @@ def cmd_adopt(args, cfg):
 
     token = dict(pairs).get("access_token")
     if token:
-        try:
-            claims = jwt_decode(token)
-        except CtxError as exc:
-            print(f"  (access_token in the url not usable: {exc})")
-            claims = {}
-        if claims.get("oid") and claims.get("tid"):
-            TokenStore(cfg).save(token, None, claims.get("exp"), claims)
-            print("  access_token from the url saved too - no need to paste it again")
+        adopt_token(cfg, token)
     print("\nnow run: ctx probe")
+
+
+def adopt_token(cfg, token):
+    """Take the url's access_token, but never over a working stored one."""
+    keep = "  keeping the stored token - the url's token was not used"
+    if "\u2026" in token or "..." in token:
+        print("  the access_token in that url is truncated (contains an ellipsis)")
+        print("  devtools shortens long urls - copy it from the Headers pane instead")
+        print(keep)
+        return
+    parts = token.split(".")
+    if len(parts) == 3 and len(parts[2]) < 40:
+        print(f"  the access_token in that url looks truncated - its signature is "
+              f"{len(parts[2])} chars")
+        print(keep)
+        return
+    try:
+        claims = jwt_decode(token)
+    except CtxError as exc:
+        print(f"  the access_token in that url is not usable: {exc}")
+        print(keep)
+        return
+    if not claims.get("oid") or not claims.get("tid"):
+        print("  the access_token in that url has no oid/tid claims")
+        print(keep)
+        return
+    exp = int(claims.get("exp") or 0)
+    if exp and exp <= time.time():
+        print(f"  the access_token in that url expired "
+              f"{(int(time.time()) - exp) // 60} min ago")
+        print(keep + " - get a fresh one with: ctx login --paste")
+        return
+    store = TokenStore(cfg)
+    existing = store.load()
+    if existing and int(existing.get("expires_at") or 0) > time.time() \
+            and existing.get("access_token") != token:
+        print("  stored token is still valid, so the url's token was left alone")
+        return
+    store.save(token, None, exp, claims)
+    print(f"  access_token from the url saved "
+          f"({(exp - int(time.time())) // 60} min remaining)")
 
 
 PREVIOUS_PARAM_KEYS = {
@@ -2051,6 +2087,11 @@ def cmd_probe(args, cfg):
                            debug=args.verbose, overrides=over)
         if result.error:
             print(f"  [fail] {name}: {result.error}")
+            if "401" in result.error or "nauthorized" in result.error:
+                print("\n  that is the token being rejected, not the frame -")
+                print("  the url's token has probably expired. get a fresh one:")
+                print("    ctx login --paste")
+                return
             continue
         if not result.text.strip():
             print(f"  [fail] {name}: accepted but returned no text")
@@ -2357,6 +2398,9 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+    except CtxError as exc:
+        eprint(f"error: {exc}")
+        sys.exit(1)
     except KeyboardInterrupt:
         print()
         sys.exit(130)

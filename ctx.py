@@ -327,6 +327,11 @@ class Config:
             self.data["license_type"] = os.environ["CTX_LICENSE_TYPE"]
         if os.environ.get("CTX_WEB_SEARCH"):
             self.data["web_search"] = os.environ["CTX_WEB_SEARCH"] not in ("0", "false", "no")
+        if os.environ.get("CTX_MAX_ITER"):
+            try:
+                self.data["max_iter"] = max(1, int(os.environ["CTX_MAX_ITER"]))
+            except ValueError:
+                pass
         if os.environ.get("CTX_MAX_TOKENS"):
             try:
                 self.data["max_tokens"] = int(os.environ["CTX_MAX_TOKENS"])
@@ -1960,7 +1965,14 @@ class App:
         else:
             payload = f"<user>\n{user_text}\n</user>\n"
         self.history.append({"role": "user", "text": user_text})
-        for _ in range(int(self.cfg.data["max_iter"])):
+        rounds = int(self.cfg.data["max_iter"])
+        used = 0
+        while True:
+            if used >= rounds:
+                if not self.extend_rounds(used, quiet):
+                    break
+                rounds += int(self.cfg.data["max_iter"])
+            used += 1
             result = self.send(payload, tone, quiet=quiet)
             if result.error:
                 self._report_error(result)
@@ -2009,9 +2021,24 @@ class App:
             for name, _meta, out in results:
                 self.history.append({"role": "tool", "text": f"[Result of {name}]: {out}"})
             payload = delta_message(results)
-        if not quiet:
-            eprint("  reached max tool iterations - ask it to wrap up")
         self.save_session()
+
+    def extend_rounds(self, used, quiet):
+        """Out of tool rounds mid-task - offer more rather than just stopping."""
+        if quiet or not sys.stdin.isatty():
+            if not quiet:
+                eprint(f"  stopped after {used} tool rounds (max_iter) - nothing is "
+                       "lost, say 'continue' to carry on")
+            return False
+        print(f"\n  {used} tool rounds used and it is still working.")
+        print("  nothing is lost either way - the files it read and wrote stay in")
+        print("  this conversation, so you can also answer n and redirect it.")
+        try:
+            answer = input(f"  give it {self.cfg.data['max_iter']} more? [Y/n] ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return False
+        return not answer.strip().lower().startswith("n")
 
     def _call_summary(self, name, args):
         for k in ("path", "filePath", "file", "pattern", "command", "cmd"):
@@ -2550,6 +2577,7 @@ HELP_TEXT = """commands:
   /ctx               context statistics and turns used this conversation
   /graph             knowledge graph status (graphify-out/)
   /issues [id]       local issue tracker (issues.json)
+  /iter [n]          show or set tool rounds per message
   /clear             reset conversation and history
   /save [file]       save transcript (default under the config dir)
   /sessions          list saved sessions (resume with: ctx --resume [id])
@@ -2818,6 +2846,17 @@ def repl(app):
             app.drop_files(globs)
             print(f"context: {app.ctx.stats()[0]} files")
             continue
+        if line.startswith("/iter"):
+            parts = line.split()
+            if len(parts) > 1:
+                try:
+                    app.cfg.data["max_iter"] = max(1, int(parts[1]))
+                except ValueError:
+                    print("usage: /iter [n]")
+                    continue
+            print(f"max_iter {app.cfg.data['max_iter']} "
+                  "(tool rounds per message, each one is a turn)")
+            continue
         if line == "/ctx":
             n, size = app.ctx.stats()
             tree, blocks = app.ctx.render()
@@ -2933,6 +2972,8 @@ def main():
     parser.add_argument("--new", action="store_true", help="fresh conversation for every question")
     parser.add_argument("--resume", nargs="?", const="", default=None, metavar="ID",
                         help="continue the most recent (or the given) saved session")
+    parser.add_argument("--max-iter", type=int, dest="max_iter",
+                        help="tool rounds per message (default 4, each one is a turn)")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--timeout", type=int, help="per-request timeout in seconds")
     sub = parser.add_subparsers(dest="cmd")
@@ -3010,6 +3051,8 @@ def main():
     if not root.is_dir():
         eprint(f"not a directory: {root}")
         sys.exit(1)
+    if args.max_iter:
+        cfg.data["max_iter"] = max(1, args.max_iter)
     app = App(cfg, root, auto_yes=auto_yes, verbose=args.verbose)
     if args.new:
         app.rotate_pending = True

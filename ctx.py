@@ -1054,6 +1054,26 @@ def looks_like_confabulation(text):
     return any(re.search(p, text, re.IGNORECASE) for p in CONFAB_PATTERNS)
 
 
+DEFLECTION_MARKERS = (
+    "let's try a different topic",
+    "let us try a different topic",
+    "let's talk about something else",
+    "i can't chat about",
+    "i cannot chat about",
+    "i'm not able to discuss",
+    "i'd prefer not to continue",
+    "sorry, i can't help with that",
+)
+
+
+def looks_like_deflection(text):
+    """The backend's canned refusal, which arrives as an ordinary answer."""
+    low = (text or "").strip().lower()
+    if not low or len(low) > 400:
+        return False
+    return any(marker in low for marker in DEFLECTION_MARKERS)
+
+
 def strip_thinking(text):
     lines = text.split("\n")
     kept = []
@@ -1241,6 +1261,26 @@ class ToolBox:
             p = self.app.root / p
         return p
 
+    def _suggest_paths(self, wanted, limit=5):
+        """A wrong guess should not end the task - say where the file really is."""
+        name = Path(str(wanted)).name
+        if not name:
+            return ""
+        hits = []
+        for found in walk_files(self.app.root):
+            if found.name == name:
+                hits.append(str(found.relative_to(self.app.root)))
+                if len(hits) >= limit:
+                    break
+        if not hits:
+            stem = Path(name).stem.lower()
+            near = [str(f.relative_to(self.app.root)) for f in walk_files(self.app.root)
+                    if stem and stem in f.name.lower()][:limit]
+            if not near:
+                return ""
+            return " - nothing by that name; similar: " + ", ".join(near)
+        return " - did you mean: " + ", ".join(hits)
+
     def read(self, args):
         path = args.get("path") or args.get("filePath") or args.get("file")
         if not path:
@@ -1249,7 +1289,7 @@ class ToolBox:
         try:
             text = p.read_text("utf-8", errors="replace")
         except OSError as e:
-            return f"ERROR: {e}"
+            return f"ERROR: {e}{self._suggest_paths(path)}"
         lines = text.split("\n")
         start = args.get("start")
         end = args.get("end")
@@ -1950,9 +1990,10 @@ class App:
             self._report_empty(result)
         return text
 
-    def run_task(self, user_text, quiet=False):
+    def run_task(self, user_text, quiet=False, retried=False):
         tone = self.model_ref()
         nudged = False
+        mark = len(self.history)
         if self.session is None or self.rotate_pending:
             self.new_session()
             if self.history:
@@ -1996,11 +2037,18 @@ class App:
                     if not quiet:
                         eprint("  (model claimed it had no tools - nudging)")
                     continue
+                if looks_like_deflection(result.text) and not retried:
+                    if self.retry_fresh(result.text, quiet):
+                        del self.history[mark:]
+                        self.rotate_pending = True
+                        return self.run_task(user_text, quiet, retried=True)
                 self.history.append({"role": "assistant", "text": result.text})
                 if not quiet:
                     shown = strip_thinking(result.text)
                     if shown:
                         print(shown)
+                        if looks_like_deflection(result.text):
+                            self._explain_deflection()
                     else:
                         self._report_empty(result)
                 self.save_session()
@@ -2022,6 +2070,25 @@ class App:
                 self.history.append({"role": "tool", "text": f"[Result of {name}]: {out}"})
             payload = delta_message(results)
         self.save_session()
+
+    def _explain_deflection(self):
+        print("\n  that is the backend deflecting, not an answer about your code.")
+        print("  it filters on the whole conversation, so a long or unusual one")
+        print("  keeps tripping it. /clear starts over, or ctx --new for one task.")
+
+    def retry_fresh(self, text, quiet):
+        """A deflection is usually sticky to the conversation - offer a new one."""
+        if quiet or not sys.stdin.isatty():
+            return False
+        print(f"\n  the backend deflected: {text.strip().splitlines()[0][:70]}")
+        print("  this is usually the conversation, not the request - the filter")
+        print("  looks at the whole history and a long one keeps tripping it.")
+        try:
+            answer = input("  retry in a fresh conversation? [Y/n] ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return False
+        return not answer.strip().lower().startswith("n")
 
     def extend_rounds(self, used, quiet):
         """Out of tool rounds mid-task - offer more rather than just stopping."""

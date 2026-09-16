@@ -200,7 +200,7 @@ USAGE = """examples:
                          (works around conditional access blocks)
   ctx status             token expiry, model, config location
   ctx probe              find a chat frame the backend accepts
-  ctx adopt              copy query parameters from the browser's websocket url
+  ctx adopt --clipboard  copy query parameters from the browser's websocket url
   ctx                    interactive session in the current folder
   ctx ask "summarize ."  one question, one answer, then exit
 
@@ -508,11 +508,16 @@ def device_login(store):
                    "this resource")
 
 
-def paste_login(store):
+def paste_login(store, args=None):
     print("Paste the access token (audience https://substrate.office.com/sydney).")
     print("In the browser: m365.cloud.microsoft/chat -> devtools -> Network -> WS ->")
-    print("substrate.office.com frame URL -> copy the access_token query parameter.")
-    token = getpass.getpass("token: ").strip()
+    print("the Chathub row -> Headers -> Request URL -> its access_token parameter.")
+    print("Or copy the whole url and run: ctx login --paste --clipboard")
+    token = read_long_input(args or argparse.Namespace(), "token: ")
+    if token.startswith(("ws", "http")) and "access_token=" in token:
+        token = urllib.parse.parse_qs(
+            urllib.parse.urlsplit(token).query).get("access_token", [""])[0]
+        print(f"  pulled the access_token out of that url ({len(token)} chars)")
     if not token:
         raise CtxError("empty token")
     claims = jwt_decode(token)
@@ -1966,7 +1971,7 @@ class App:
 def cmd_login(args, cfg):
     store = TokenStore(cfg)
     if args.paste:
-        paste_login(store)
+        paste_login(store, args)
     else:
         device_login(store)
 
@@ -1974,6 +1979,59 @@ def cmd_login(args, cfg):
 def cmd_logout(args, cfg):
     TokenStore(cfg).clear()
     print("token removed")
+
+
+TTY_LINE_LIMIT = 4096
+
+CLIPBOARD_COMMANDS = (
+    ("powershell.exe", ["powershell.exe", "-NoProfile", "-Command", "Get-Clipboard"]),
+    ("pbpaste", ["pbpaste"]),
+    ("wl-paste", ["wl-paste", "--no-newline"]),
+    ("xclip", ["xclip", "-selection", "clipboard", "-o"]),
+    ("xsel", ["xsel", "--clipboard", "--output"]),
+)
+
+
+def read_clipboard():
+    """Read the clipboard directly - the tty drops pasted lines over 4095 bytes."""
+    tried = []
+    for binary, cmd in CLIPBOARD_COMMANDS:
+        if not shutil.which(binary):
+            continue
+        tried.append(binary)
+        try:
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, timeout=20)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        text = "".join(proc.stdout.decode("utf-8", "replace").split())
+        if text:
+            return text
+    if tried:
+        raise CtxError("clipboard was empty (tried: " + ", ".join(tried) + ")")
+    raise CtxError("no clipboard tool found - tried powershell.exe, pbpaste, "
+                   "wl-paste, xclip, xsel. use: ctx adopt --file URLFILE")
+
+
+def read_long_input(args, prompt):
+    """Get a value too long to survive a terminal paste."""
+    if getattr(args, "clipboard", False):
+        value = read_clipboard()
+        print(f"  read {len(value)} chars from the clipboard")
+        return value
+    path = getattr(args, "file", None)
+    if path:
+        try:
+            value = "".join(Path(path).read_text("utf-8").split())
+        except OSError as exc:
+            raise CtxError(f"cannot read {path}: {exc}")
+        print(f"  read {len(value)} chars from {path}")
+        return value
+    value = getpass.getpass(prompt).strip()
+    if len(value) >= TTY_LINE_LIMIT - 1:
+        print(f"  warning: got exactly {len(value)} chars - the terminal truncates")
+        print(f"  pasted lines at {TTY_LINE_LIMIT - 1}. retry with --clipboard or --file")
+    return value
 
 
 def cmd_adopt(args, cfg):
@@ -1985,10 +2043,10 @@ def cmd_adopt(args, cfg):
         cfg.save()
         print(f"ws params cleared, ws base back to {WS_BASE_DEFAULT}")
         return
-    print("Paste the browser's websocket url.")
     print("In the browser: m365.cloud.microsoft/chat -> devtools -> Network -> WS ->")
-    print("the Chathub row -> Headers -> Request URL (the whole thing).")
-    raw = getpass.getpass("url: ").strip()
+    print("right-click the Chathub row -> Copy -> Copy link address.")
+    print("Then: ctx adopt --clipboard   (the url is too long to paste into a terminal)")
+    raw = read_long_input(args, "url: ")
     if not raw:
         raise CtxError("empty url")
     parts = urllib.parse.urlsplit(raw)
@@ -2023,6 +2081,10 @@ def cmd_adopt(args, cfg):
     for key in dropped:
         print(f"  - {key} (browser does not send it)")
     print(f"\n  {len(adopted)} parameters saved to {cfg.path}")
+    if len(adopted) < 4:
+        print(f"  that is far fewer than the browser sends - the url was truncated")
+        print(f"  ({len(raw)} chars read; a real one is well over {TTY_LINE_LIMIT})")
+        print("  retry with: ctx adopt --clipboard")
 
     token = dict(pairs).get("access_token")
     if token:
@@ -2357,6 +2419,9 @@ def main():
                "remedy: sign in at m365.cloud.microsoft/chat, then devtools -> "
                "Network -> WS -> substrate.office.com frame url, copy its "
                "access_token query parameter and run: ctx login --paste")
+    p_login.add_argument("--clipboard", action="store_true",
+                         help="read from the clipboard instead of a terminal paste")
+    p_login.add_argument("--file", help="read from a file instead of a terminal paste")
     p_login.add_argument("--paste", action="store_true",
                          help="paste a token from browser devtools instead "
                               "(works around conditional access blocks)")
@@ -2366,6 +2431,10 @@ def main():
                                  "(use after an InvalidRequest)")
     p_adopt = sub.add_parser("adopt", help="copy the query parameters from the "
                                            "browser's own websocket url")
+    p_adopt.add_argument("--clipboard", action="store_true",
+                         help="read the url from the clipboard (avoids the "
+                              "terminal's 4095 byte paste limit)")
+    p_adopt.add_argument("--file", help="read the url from a file")
     p_adopt.add_argument("--reset", action="store_true",
                          help="discard adopted parameters and use the built-in defaults")
     p_ask = sub.add_parser("ask", help="ask one question and exit")

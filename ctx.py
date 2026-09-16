@@ -103,6 +103,10 @@ VARIANTS = ",".join([
 
 DEBUG_FRAME_CHARS = 2000
 
+# regenerated every turn even when a captured frame template is in use
+PER_TURN_FRAME = ("clientCorrelationId", "traceId", "sessionId",
+                  "isStartOfSession", "tone")
+
 # regenerated every turn - never adopted from a captured browser url
 PER_TURN_PARAMS = {"chatsessionid", "clientrequestid", "X-SessionId",
                    "ConversationId", "access_token"}
@@ -154,6 +158,7 @@ DEFAULT_CONFIG = {
     "graphify_cmd": "",
     "license_type": "Starter",
     "ws_params": {},
+    "frame_template": {},
     "web_search": True,
 }
 
@@ -201,6 +206,7 @@ USAGE = """examples:
   ctx status             token expiry, model, config location
   ctx probe              find a chat frame the backend accepts
   ctx adopt --clipboard  copy query parameters from the browser's websocket url
+  ctx adopt --frame      copy the browser's chat frame and diff it against ctx's
   ctx                    interactive session in the current folder
   ctx ask "summarize ."  one question, one answer, then exit
 
@@ -701,8 +707,37 @@ def fold_text(answer, nxt):
     return nxt, None
 
 
+def apply_frame_template(template, text, tone, session_id, request_id, is_start):
+    args = copy.deepcopy(template)
+    args["clientCorrelationId"] = request_id
+    args["traceId"] = request_id
+    args["sessionId"] = session_id
+    args["isStartOfSession"] = is_start
+    args["tone"] = tone
+    message = args.get("message")
+    if not isinstance(message, dict):
+        message = {}
+        args["message"] = message
+    message["text"] = text
+    message["requestId"] = request_id
+    client = args.get("clientInfo")
+    if isinstance(client, dict):
+        client["clientSessionId"] = session_id
+    return args
+
+
 def build_chat_frame(text, tone, session_id, request_id, is_start,
-                     web_search=True, overrides=None):
+                     web_search=True, overrides=None, template=None):
+    if template:
+        args = apply_frame_template(template, text, tone, session_id,
+                                    request_id, is_start)
+        for key, value in (overrides or {}).items():
+            if value is None:
+                args.pop(key, None)
+            else:
+                args[key] = value
+        return {"arguments": [args], "invocationId": "0", "target": "chat",
+                "type": 4}
     gmtoff = time.localtime().tm_gmtoff or 0
     args = {
         "source": "officeweb",
@@ -844,7 +879,8 @@ def chat_once(cfg, token, claims, session, text, tone, timeout_s, on_frame=None,
         chat = build_chat_frame(text, tone, session.session_id, request_id,
                                 session.turn_count == 0,
                                 web_search=bool(cfg.data.get("web_search", True)),
-                                overrides=overrides.get("frame"))
+                                overrides=overrides.get("frame"),
+                                template=cfg.data.get("frame_template") or None)
         if debug:
             probe = copy.deepcopy(chat)
             probe["arguments"][0]["message"]["text"] = f"<{len(text)} chars>"
@@ -2034,14 +2070,82 @@ def read_long_input(args, prompt):
     return value
 
 
+def shorten(value, width=52):
+    text = value if isinstance(value, str) else json.dumps(value, sort_keys=True)
+    return text if len(text) <= width else text[: width - 3] + "..."
+
+
+def diff_frames(browser, ours):
+    lines = []
+    for key in sorted(set(browser) - set(ours)):
+        lines.append(f"  + {key} = {shorten(browser[key])}")
+    for key in sorted(set(ours) - set(browser)):
+        lines.append(f"  - {key} = {shorten(ours[key])}")
+    for key in sorted(set(browser) & set(ours)):
+        if key in PER_TURN_FRAME or key == "message":
+            continue
+        if browser[key] != ours[key]:
+            lines.append(f"  ~ {key}")
+            lines.append(f"      browser: {shorten(browser[key])}")
+            lines.append(f"      ctx    : {shorten(ours[key])}")
+    return lines
+
+
+def parse_chat_frame(raw):
+    raw = raw.strip().strip(RS).strip()
+    try:
+        frame = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise CtxError(f"that is not valid json ({exc}) - copy the whole message")
+    if isinstance(frame, dict) and frame.get("target") == "chat":
+        arguments = frame.get("arguments") or []
+        if not arguments or not isinstance(arguments[0], dict):
+            raise CtxError("that chat frame has no arguments object")
+        return arguments[0]
+    if isinstance(frame, dict) and "message" in frame:
+        return frame
+    raise CtxError('that is not the chat frame - look for the outgoing message '
+                   'with "target":"chat"')
+
+
+def adopt_frame(args, cfg):
+    print("In devtools: Network -> WS -> the Chathub row -> Messages tab.")
+    print('Find the outgoing (green) message containing "target":"chat" -')
+    print("right-click it -> Copy message. Then rerun with --clipboard.")
+    theirs = parse_chat_frame(read_long_input(args, "frame: "))
+    ours = build_chat_frame("hi", cfg.model_tone(cfg.data["model"]),
+                            "SID", "RID", True,
+                            web_search=bool(cfg.data.get("web_search", True)))["arguments"][0]
+    lines = diff_frames(theirs, ours)
+    if lines:
+        print("\n  + browser only   - ctx only   ~ different\n")
+        print("\n".join(lines))
+    else:
+        print("\n  no differences outside the per-turn fields")
+    stored = copy.deepcopy(theirs)
+    message = stored.get("message")
+    if isinstance(message, dict):
+        message["text"] = ""
+    cfg.data["frame_template"] = stored
+    cfg.save()
+    print(f"\n  frame saved as a template ({len(stored)} fields) to {cfg.path}")
+    print("  the message text and the ids in PER_TURN_FRAME are filled in per turn")
+    print("\nnow run: ctx probe")
+
+
 def cmd_adopt(args, cfg):
     if cfg.data.get("provider", "m365") != "m365":
         raise CtxError("adopt only applies to the m365 provider")
     if getattr(args, "reset", False):
         cfg.data["ws_params"] = {}
+        cfg.data["frame_template"] = {}
         cfg.data["ws_base"] = WS_BASE_DEFAULT
         cfg.save()
-        print(f"ws params cleared, ws base back to {WS_BASE_DEFAULT}")
+        print(f"ws params and frame template cleared, "
+              f"ws base back to {WS_BASE_DEFAULT}")
+        return
+    if getattr(args, "frame", False):
+        adopt_frame(args, cfg)
         return
     print("In the browser: m365.cloud.microsoft/chat -> devtools -> Network -> WS ->")
     print("right-click the Chathub row -> Copy -> Copy link address.")
@@ -2223,6 +2327,9 @@ def cmd_status(args, cfg):
         adopted = cfg.data.get("ws_params") or {}
         print(f"ws params: {len(adopted)} adopted" if adopted
               else "ws params: built-in defaults (run: ctx adopt)")
+        template = cfg.data.get("frame_template") or {}
+        print(f"frame    : {len(template)} fields adopted" if template
+              else "frame    : built-in (run: ctx adopt --frame)")
         print(f"license  : {cfg.data.get('license_type') or '(omitted)'}")
         print(f"websearch: {'on' if cfg.data.get('web_search', True) else 'off'}")
     if provider != "m365":
@@ -2456,6 +2563,9 @@ def main():
                          help="read the url from the clipboard (avoids the "
                               "terminal's 4095 byte paste limit)")
     p_adopt.add_argument("--file", help="read the url from a file")
+    p_adopt.add_argument("--frame", action="store_true",
+                         help="adopt the browser's outgoing chat frame instead "
+                              "of the url, and diff it against ctx's")
     p_adopt.add_argument("--reset", action="store_true",
                          help="discard adopted parameters and use the built-in defaults")
     p_ask = sub.add_parser("ask", help="ask one question and exit")

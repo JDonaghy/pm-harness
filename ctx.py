@@ -533,7 +533,7 @@ def paste_login(store, args=None):
     print(f"{SOCKET_FILTER} -> the Chathub row -> Headers -> Request URL ->")
     print("its access_token parameter.")
     print("Or copy the whole url and run: ctx login --paste --clipboard")
-    token = read_long_input(args or argparse.Namespace(), "token: ")
+    token = "".join(read_long_input(args or argparse.Namespace(), "token: ").split())
     if token.startswith(("ws", "http")) and "access_token=" in token:
         token = urllib.parse.parse_qs(
             urllib.parse.urlsplit(token).query).get("access_token", [""])[0]
@@ -2209,7 +2209,7 @@ def read_clipboard():
                                   stderr=subprocess.DEVNULL, timeout=20)
         except (OSError, subprocess.SubprocessError):
             continue
-        text = "".join(proc.stdout.decode("utf-8", "replace").split())
+        text = proc.stdout.decode("utf-8", "replace").strip()
         if text:
             return text
     if tried:
@@ -2227,7 +2227,7 @@ def read_long_input(args, prompt):
     path = getattr(args, "file", None)
     if path:
         try:
-            value = "".join(Path(path).read_text("utf-8").split())
+            value = Path(path).read_text("utf-8").strip()
         except OSError as exc:
             raise CtxError(f"cannot read {path}: {exc}")
         print(f"  read {len(value)} chars from {path}")
@@ -2270,21 +2270,54 @@ def diff_frames(browser, ours):
     return lines
 
 
+def split_json_objects(raw):
+    """Signalr packs several frames into one message, separated by RS."""
+    decoder = json.JSONDecoder()
+    found, idx, size = [], 0, len(raw)
+    while idx < size:
+        while idx < size and raw[idx].isspace():
+            idx += 1                        # RS is whitespace to python
+        if idx >= size:
+            break
+        try:
+            obj, idx = decoder.raw_decode(raw, idx)
+        except json.JSONDecodeError as exc:
+            if found:
+                break                       # trailing junk after good frames
+            raise CtxError(f"that is not valid json ({exc}) - copy the whole message")
+        found.append(obj)
+    return found
+
+
+def describe_frames(objects):
+    seen = []
+    for obj in objects:
+        if not isinstance(obj, dict):
+            seen.append("a bare " + type(obj).__name__)
+        else:
+            seen.append(str(obj.get("target") or f"type {obj.get('type')}"))
+    return ", ".join(seen)
+
+
 def parse_chat_frame(raw):
-    raw = raw.strip().strip(RS).strip()
-    try:
-        frame = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise CtxError(f"that is not valid json ({exc}) - copy the whole message")
-    if isinstance(frame, dict) and frame.get("target") == "chat":
-        arguments = frame.get("arguments") or []
-        if not arguments or not isinstance(arguments[0], dict):
-            raise CtxError("that chat frame has no arguments object")
-        return arguments[0]
-    if isinstance(frame, dict) and "message" in frame:
-        return frame
-    raise CtxError('that is not the chat frame - look for the outgoing message '
-                   'with "target":"chat"')
+    objects = split_json_objects((raw or "").strip())
+    if not objects:
+        raise CtxError("nothing json-shaped in that clipboard - copy the message")
+    for frame in objects:
+        if isinstance(frame, dict) and frame.get("target") == "chat":
+            arguments = frame.get("arguments") or []
+            if not arguments or not isinstance(arguments[0], dict):
+                raise CtxError("that chat frame has no arguments object")
+            if len(objects) > 1:
+                print(f"  {len(objects)} frames in that message "
+                      f"({describe_frames(objects)}) - took the chat one")
+            return arguments[0]
+    for frame in objects:
+        if isinstance(frame, dict) and "message" in frame:
+            return frame
+    raise CtxError(f"no chat frame there - found {len(objects)} json object(s): "
+                   f"{describe_frames(objects)}. copy the outgoing message whose "
+                   'text contains "target":"chat"')
 
 
 def adopt_frame(args, cfg):
@@ -2427,6 +2460,7 @@ def cmd_adopt(args, cfg):
 
 
 def adopt_url(raw, cfg, quiet=False):
+    raw = "".join((raw or "").split())      # undo any clipboard line wrapping
     if not raw:
         raise CtxError("empty url")
     parts = urllib.parse.urlsplit(raw)
@@ -2479,6 +2513,7 @@ def adopt_url(raw, cfg, quiet=False):
 
 def adopt_token(cfg, token):
     """Take the url's access_token, but never over a working stored one."""
+    token = "".join((token or "").split())
     keep = "  keeping the stored token - the url's token was not used"
     if "\u2026" in token or "..." in token:
         print("  the access_token in that url is truncated (contains an ellipsis)")

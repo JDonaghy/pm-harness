@@ -103,6 +103,10 @@ VARIANTS = ",".join([
 
 DEBUG_FRAME_CHARS = 2000
 
+# regenerated every turn - never adopted from a captured browser url
+PER_TURN_PARAMS = {"chatsessionid", "clientrequestid", "X-SessionId",
+                   "ConversationId", "access_token"}
+
 ALLOWED_MESSAGE_TYPES = [
     "Chat",
     "Suggestion",
@@ -149,6 +153,7 @@ DEFAULT_CONFIG = {
     "max_tokens": 8192,
     "graphify_cmd": "",
     "license_type": "Starter",
+    "ws_params": {},
     "web_search": True,
 }
 
@@ -195,6 +200,7 @@ USAGE = """examples:
                          (works around conditional access blocks)
   ctx status             token expiry, model, config location
   ctx probe              find a chat frame the backend accepts
+  ctx adopt              copy query parameters from the browser's websocket url
   ctx                    interactive session in the current folder
   ctx ask "summarize ."  one question, one answer, then exit
 
@@ -773,13 +779,19 @@ def chat_once(cfg, token, claims, session, text, tone, timeout_s, on_frame=None,
         "licenseType": cfg.data.get("license_type") or "Starter",
         "agent": "web",
         "scenario": "OfficeWebIncludedCopilot",
+        "isEdu": "false",
+        "X-RoutingParameterSessionKey": session.session_id,
     }
+    for key, value in (cfg.data.get("ws_params") or {}).items():
+        if key not in PER_TURN_PARAMS:
+            params[key] = value
     for key, value in (overrides.get("query") or {}).items():
         if value is None:
             params.pop(key, None)
         else:
             params[key] = value
-    params = urllib.parse.urlencode({k: v for k, v in params.items() if v != ""})
+    params = urllib.parse.urlencode(
+        {k: v for k, v in params.items() if v != ""}, safe=",")
     url = f"{cfg.data['ws_base']}/{claims['oid']}@{claims['tid']}?{params}"
     if debug:
         eprint("  -> ws " + redact_token(url))
@@ -1943,6 +1955,62 @@ def cmd_logout(args, cfg):
     print("token removed")
 
 
+def cmd_adopt(args, cfg):
+    if cfg.data.get("provider", "m365") != "m365":
+        raise CtxError("adopt only applies to the m365 provider")
+    print("Paste the browser's websocket url.")
+    print("In the browser: m365.cloud.microsoft/chat -> devtools -> Network -> WS ->")
+    print("the Chathub row -> Headers -> Request URL (the whole thing).")
+    raw = getpass.getpass("url: ").strip()
+    if not raw:
+        raise CtxError("empty url")
+    parts = urllib.parse.urlsplit(raw)
+    if parts.scheme not in ("ws", "wss", "http", "https") or not parts.netloc:
+        raise CtxError("that does not look like a url - expected wss://...")
+    pairs = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+    if not pairs:
+        raise CtxError("no query parameters in that url - copy the whole Request URL")
+    adopted = {k: v for k, v in pairs if k not in PER_TURN_PARAMS}
+
+    path = parts.path
+    tail = path.rsplit("/", 1)[-1]
+    if "@" in tail:
+        path = path[: -(len(tail) + 1)]
+    cfg.data["ws_base"] = f"wss://{parts.netloc}{path}"
+    cfg.data["ws_params"] = adopted
+    cfg.save()
+
+    print(f"\n  ws base : {cfg.data['ws_base']}")
+    old = set(PREVIOUS_PARAM_KEYS)
+    for key in sorted(adopted):
+        mark = " " if key in old else "+"
+        value = adopted[key]
+        if len(value) > 60:
+            value = value[:57] + "..."
+        print(f"  {mark} {key}={value}")
+    dropped = sorted(old - set(adopted) - PER_TURN_PARAMS)
+    for key in dropped:
+        print(f"  - {key} (browser does not send it)")
+    print(f"\n  {len(adopted)} parameters saved to {cfg.path}")
+
+    token = dict(pairs).get("access_token")
+    if token:
+        try:
+            claims = jwt_decode(token)
+        except CtxError as exc:
+            print(f"  (access_token in the url not usable: {exc})")
+            claims = {}
+        if claims.get("oid") and claims.get("tid"):
+            TokenStore(cfg).save(token, None, claims.get("exp"), claims)
+            print("  access_token from the url saved too - no need to paste it again")
+    print("\nnow run: ctx probe")
+
+
+PREVIOUS_PARAM_KEYS = {
+    "variants", "source", "product", "agentHost", "licenseType", "agent",
+    "scenario", "isEdu", "X-RoutingParameterSessionKey",
+}
+
 PROBE_CASES = [
     ("baseline (current config)", {}, None),
     ("web search off", {"frame": {"plugins": []}},
@@ -2008,6 +2076,9 @@ def cmd_status(args, cfg):
         print(f"api key  : {'set' if cfg.data.get('api_key') else '(unset)'}")
     print(f"model    : {cfg.data['model']}")
     if provider == "m365":
+        adopted = cfg.data.get("ws_params") or {}
+        print(f"ws params: {len(adopted)} adopted" if adopted
+              else "ws params: built-in defaults (run: ctx adopt)")
         print(f"license  : {cfg.data.get('license_type') or '(omitted)'}")
         print(f"websearch: {'on' if cfg.data.get('web_search', True) else 'off'}")
     if provider != "m365":
@@ -2223,6 +2294,8 @@ def main():
     sub.add_parser("status", help="show config and token status")
     sub.add_parser("probe", help="find a chat frame the backend accepts "
                                  "(use after an InvalidRequest)")
+    sub.add_parser("adopt", help="copy the query parameters from the browser's "
+                                 "own websocket url")
     p_ask = sub.add_parser("ask", help="ask one question and exit")
     p_ask.add_argument("question", nargs="+", help="the question")
     args = parser.parse_args(normalize_resume_argv(sys.argv[1:]))
@@ -2238,6 +2311,9 @@ def main():
     if args.cmd == "logout":
         cmd_logout(args, cfg)
         return
+    if args.cmd == "adopt":
+        cmd_adopt(args, cfg)
+        return 0
     if args.cmd == "probe":
         cmd_probe(args, cfg)
         return 0

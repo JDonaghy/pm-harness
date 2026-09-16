@@ -2271,21 +2271,24 @@ def diff_frames(browser, ours):
 
 
 def split_json_objects(raw):
-    """Signalr packs several frames into one message, separated by RS."""
+    """Signalr packs several frames into one message. Whatever ends up between
+    them once the clipboard has been through devtools and an editor - RS, a
+    replacement char, nothing at all - find each object by scanning for it."""
     decoder = json.JSONDecoder()
-    found, idx, size = [], 0, len(raw)
+    found, idx, size, failure = [], 0, len(raw), None
     while idx < size:
-        while idx < size and raw[idx].isspace():
-            idx += 1                        # RS is whitespace to python
-        if idx >= size:
+        start = raw.find("{", idx)
+        if start < 0:
             break
         try:
-            obj, idx = decoder.raw_decode(raw, idx)
+            obj, idx = decoder.raw_decode(raw, start)
         except json.JSONDecodeError as exc:
-            if found:
-                break                       # trailing junk after good frames
-            raise CtxError(f"that is not valid json ({exc}) - copy the whole message")
+            failure = failure or exc
+            idx = start + 1                 # not an object start - keep looking
+            continue
         found.append(obj)
+    if not found and failure is not None:
+        raise CtxError(f"that is not valid json ({failure}) - copy the whole message")
     return found
 
 

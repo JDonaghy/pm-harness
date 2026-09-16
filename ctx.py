@@ -156,6 +156,7 @@ DEFAULT_CONFIG = {
     "api_key": "",
     "max_tokens": 8192,
     "graphify_cmd": "",
+    "graph_hint": True,
     "license_type": "Starter",
     "ws_params": {},
     "frame_template": {},
@@ -2646,6 +2647,46 @@ def cmd_commit(args, app):
     print(proc.stdout.decode("utf-8", "replace").strip())
 
 
+MIN_FILES_FOR_GRAPH_HINT = 8
+
+
+def graph_hint_seen(cfg, root):
+    try:
+        seen = (Path(cfg.home) / "graph_hints").read_text("utf-8").splitlines()
+    except OSError:
+        return False
+    return str(root) in seen
+
+
+def remember_graph_hint(cfg, root):
+    try:
+        Path(cfg.home).mkdir(parents=True, exist_ok=True)
+        with (Path(cfg.home) / "graph_hints").open("a", encoding="utf-8") as handle:
+            handle.write(str(root) + "\n")
+    except OSError:
+        pass
+
+
+def maybe_suggest_graph(app):
+    """Mention graphify once per folder, and only where it can be acted on."""
+    cfg = app.cfg
+    if not cfg.data.get("graph_hint", True) or app.has_graph():
+        return
+    nfiles, _ = app.ctx.stats()
+    if nfiles < MIN_FILES_FOR_GRAPH_HINT:
+        return
+    if not graphify_command(cfg, app.root):
+        return          # nothing to suggest running - stay quiet, do not mark seen
+    if graph_hint_seen(cfg, app.root):
+        return
+    print("tip: no knowledge graph in this folder. `graphify update .` builds one")
+    print("     locally (no api cost, no turns) and gives the agent graph_query,")
+    print("     graph_path and graph_explain - architecture answers without")
+    print("     spending turns reading files one at a time.")
+    print('     shown once per folder; turn off with "graph_hint": false in config')
+    remember_graph_hint(cfg, app.root)
+
+
 def throttle_label(app):
     """The backend reports turns used per conversation - show it."""
     throttle = getattr(app, "throttle", None)
@@ -2667,6 +2708,7 @@ def repl(app):
                 print("note: token expired - run ctx setup if requests fail")
         except Exception:
             pass
+    maybe_suggest_graph(app)
     print("type /help for commands\n")
     while True:
         try:

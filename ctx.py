@@ -100,6 +100,8 @@ VARIANTS = ",".join([
     "Agt_bizchat_enableGpt5ForHelix",
 ])
 
+DEBUG_FRAME_CHARS = 2000
+
 ALLOWED_MESSAGE_TYPES = [
     "Chat",
     "Suggestion",
@@ -735,7 +737,8 @@ class TurnResult:
         self.message_type = message_type
 
 
-def chat_once(cfg, token, claims, session, text, tone, timeout_s, on_frame=None):
+def chat_once(cfg, token, claims, session, text, tone, timeout_s, on_frame=None,
+              debug=False):
     request_id = str(uuid.uuid4())
     params = urllib.parse.urlencode({
         "chatsessionid": request_id,
@@ -765,6 +768,8 @@ def chat_once(cfg, token, claims, session, text, tone, timeout_s, on_frame=None)
             part = part.strip()
             if not part:
                 continue
+            if debug:
+                eprint("  <- " + part[:DEBUG_FRAME_CHARS])
             try:
                 frame = json.loads(part)
             except json.JSONDecodeError:
@@ -781,6 +786,8 @@ def chat_once(cfg, token, claims, session, text, tone, timeout_s, on_frame=None)
                 part = part.strip()
                 if not part:
                     continue
+                if debug:
+                    eprint("  <- " + part[:DEBUG_FRAME_CHARS])
                 try:
                     frame = json.loads(part)
                 except json.JSONDecodeError:
@@ -1681,7 +1688,8 @@ class App:
             return self.http_chat()
         token, claims = self.creds()
         result = chat_once(self.cfg, token, claims, self.session, payload, tone,
-                           int(self.cfg.data["turn_timeout_s"]), on_frame=on_frame)
+                           int(self.cfg.data["turn_timeout_s"]), on_frame=on_frame,
+                           debug=self.verbose)
         self.session.advance()
         return result
 
@@ -1793,7 +1801,11 @@ class App:
                     continue
                 self.history.append({"role": "assistant", "text": result.text})
                 if not quiet:
-                    print(strip_thinking(result.text) or "(empty response)")
+                    shown = strip_thinking(result.text)
+                    if shown:
+                        print(shown)
+                    else:
+                        self._report_empty(result)
                 self.save_session()
                 return
             self.history.append({"role": "assistant", "text": result.text})
@@ -1823,6 +1835,19 @@ class App:
         if args.get("content") is not None:
             return f"({len(str(args.get('content')))}B content)"
         return ""
+
+    def _report_empty(self, result):
+        mt = result.message_type
+        if result.text.strip():
+            print("(no answer - the whole reply was stripped as thinking/formatting)")
+            return
+        print(f"(empty response - last bot message type: {mt or 'none'})")
+        if mt == "Disengaged":
+            print("  the backend disengaged (content filter or payload too large)")
+            print("  try: /drop to shrink context, /clear, or /model")
+        else:
+            print("  the turn completed with no bot text - rerun with --verbose to")
+            print("  dump the raw SignalR frames")
 
     def _report_error(self, result):
         err = result.error or "(empty response)"

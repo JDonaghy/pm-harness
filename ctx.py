@@ -148,7 +148,7 @@ DEFAULT_CONFIG = {
     "model": "gpt-5.6",
     "models": dict(DEFAULT_MODELS),
     "context_kb": 48,
-    "max_iter": 8,
+    "max_iter": 4,
     "turn_timeout_s": 240,
     "ws_base": WS_BASE_DEFAULT,
     "provider": "m365",
@@ -204,6 +204,8 @@ USAGE = """examples:
   ctx setup              guided first-time setup (start here)
   ctx login --paste      auth by pasting a token from browser devtools
                          (works around conditional access blocks)
+  ctx review [--staged]  review a diff before pushing (one turn)
+  ctx commit [--apply]   write a commit message for the staged diff
   ctx status             token expiry, model, config location
   ctx probe              find a chat frame the backend accepts
   ctx adopt --clipboard  copy query parameters from the browser's websocket url
@@ -1703,6 +1705,7 @@ class App:
         self.session = None
         self.history = []
         self.rotate_pending = False
+        self.throttle = None
         self.session_slot = None
         self.session_created = None
 
@@ -1927,6 +1930,18 @@ class App:
             if state["any"] and not quiet:
                 print()
 
+    def one_shot(self, prompt_text, quiet=False):
+        """A single turn with no tool loop - the cheap path for diff work."""
+        self.new_session()
+        result = self.send(prompt_text, self.model_ref(), quiet=quiet)
+        if result.error:
+            self._report_error(result)
+            return None
+        text = strip_thinking(result.text)
+        if not text and not quiet:
+            self._report_empty(result)
+        return text
+
     def run_task(self, user_text, quiet=False):
         tone = self.model_ref()
         nudged = False
@@ -1950,8 +1965,12 @@ class App:
                 return
             if result.throttle:
                 cur, mx = result.throttle
+                self.throttle = result.throttle
                 if mx and cur is not None and cur >= mx - 2:
                     self.rotate_pending = True
+                    if not quiet:
+                        eprint(f"  (turn {cur}/{mx} - starting a new conversation "
+                               "on the next message)")
             calls, _ = parse_tool_calls(result.text)
             if not calls:
                 if not nudged and looks_like_confabulation(result.text):
@@ -2525,7 +2544,7 @@ HELP_TEXT = """commands:
   /model [name]      show models or switch (sent as a per-request tone)
   /add GLOB...       force-include files in the context
   /drop GLOB...      exclude files from the context
-  /ctx               context statistics
+  /ctx               context statistics and turns used this conversation
   /graph             knowledge graph status (graphify-out/)
   /issues [id]       local issue tracker (issues.json)
   /clear             reset conversation and history
@@ -2535,6 +2554,109 @@ HELP_TEXT = """commands:
 anything else is sent to the model."""
 
 
+MAX_DIFF_CHARS = 60_000
+
+REVIEW_PROMPT = """You are reviewing a diff before it is pushed.
+
+Report only real problems: correctness bugs, missed edge cases, things that
+break at runtime, and anything the change forgot to update. Cite file and
+line. Be specific about the input or state that triggers each one.
+
+Do not restate what the diff does. Do not suggest stylistic changes. If you
+find nothing worth raising, say so in one line.
+
+DIFF
+{diff}"""
+
+COMMIT_PROMPT = """Write a git commit message for this diff.
+
+First line: imperative summary, under 72 characters, no trailing period.
+Then a blank line, then one to three short paragraphs saying why the change
+was made and what it affects, wrapped at 72 columns. No bullet lists, no
+markdown. Say what was wrong before, not just what is different now.
+
+Output only the message.
+
+DIFF
+{diff}"""
+
+
+def git_output(root, argv):
+    try:
+        proc = subprocess.run(["git"] + argv, cwd=str(root), timeout=30,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise CtxError(f"could not run git: {exc}")
+    if proc.returncode != 0:
+        detail = proc.stderr.decode("utf-8", "replace").strip()
+        raise CtxError(f"git {' '.join(argv)} failed: {detail or proc.returncode}")
+    return proc.stdout.decode("utf-8", "replace")
+
+
+def collect_diff(app, args):
+    argv = ["diff"]
+    if getattr(args, "staged", False):
+        argv.append("--staged")
+    target = getattr(args, "target", None)
+    if target:
+        argv.append(target)
+    diff = git_output(app.root, argv)
+    if not diff.strip():
+        where = "staged" if getattr(args, "staged", False) else "the working tree"
+        raise CtxError(f"no changes in {where} - stage something, or pass a ref")
+    if len(diff) > MAX_DIFF_CHARS:
+        keep = diff[:MAX_DIFF_CHARS]
+        print(f"note: diff is {len(diff)} chars, sending the first {MAX_DIFF_CHARS}")
+        diff = keep + "\n...[diff truncated]"
+    return diff
+
+
+def cmd_review(args, app):
+    diff = collect_diff(app, args)
+    answer = app.one_shot(REVIEW_PROMPT.format(diff=diff))
+    if answer:
+        print(answer)
+
+
+def cmd_commit(args, app):
+    args.staged = True
+    diff = collect_diff(app, args)
+    message = app.one_shot(COMMIT_PROMPT.format(diff=diff))
+    if not message:
+        return
+    message = message.strip().strip("`").strip()
+    print("\n" + message + "\n")
+    if not getattr(args, "apply", False):
+        print("(to use it: ctx commit --apply)")
+        return
+    if not app.auto_yes:
+        try:
+            if not input("commit with this message? [y/N] ").strip().lower().startswith("y"):
+                print("not committed")
+                return
+        except (EOFError, KeyboardInterrupt):
+            print("\nnot committed")
+            return
+    try:
+        proc = subprocess.run(["git", "commit", "-F", "-"], cwd=str(app.root),
+                              input=message.encode("utf-8"), timeout=30,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise CtxError(f"git commit failed: {exc}")
+    print(proc.stdout.decode("utf-8", "replace").strip())
+
+
+def throttle_label(app):
+    """The backend reports turns used per conversation - show it."""
+    throttle = getattr(app, "throttle", None)
+    if not throttle:
+        return ""
+    cur, mx = throttle
+    if cur is None or not mx:
+        return ""
+    return f"[{cur}/{mx}] "
+
+
 def repl(app):
     nfiles, _ = app.ctx.stats()
     print(f"model: {app.model}   files: {nfiles}   dir: {app.root}")
@@ -2542,13 +2664,13 @@ def repl(app):
         try:
             data = app.store.load()
             if data and data.get("expires_at", 0) < time.time():
-                print("note: token expired - run ctx login if requests fail")
+                print("note: token expired - run ctx setup if requests fail")
         except Exception:
             pass
     print("type /help for commands\n")
     while True:
         try:
-            line = input("you> ").strip()
+            line = input(f"{throttle_label(app)}you> ").strip()
         except EOFError:
             print()
             return
@@ -2600,6 +2722,13 @@ def repl(app):
             tree, blocks = app.ctx.render()
             print(f"{n} files, {size} bytes on disk, "
                   f"prompt context {len(tree) + len(blocks)} chars")
+            throttle = getattr(app, "throttle", None)
+            if throttle and throttle[1]:
+                cur, mx = throttle
+                print(f"conversation: turn {cur} of {mx} "
+                      f"({max(0, mx - cur)} left before it rotates)")
+            print(f"max_iter {app.cfg.data['max_iter']} "
+                  "(tool rounds per message, each one is a turn)")
             continue
         if line == "/graph":
             gj = app.root / GRAPH_JSON
@@ -2735,6 +2864,14 @@ def main():
                               "of the url, and diff it against ctx's")
     p_adopt.add_argument("--reset", action="store_true",
                          help="discard adopted parameters and use the built-in defaults")
+    p_review = sub.add_parser("review", help="review the working tree diff "
+                                             "(one turn, no tool loop)")
+    p_review.add_argument("--staged", action="store_true", help="review staged changes")
+    p_review.add_argument("target", nargs="?", help="a ref or path to diff against")
+    p_commit = sub.add_parser("commit", help="write a commit message for the "
+                                             "staged diff (one turn)")
+    p_commit.add_argument("--apply", action="store_true",
+                          help="commit with the generated message after confirming")
     p_ask = sub.add_parser("ask", help="ask one question and exit")
     p_ask.add_argument("question", nargs="+", help="the question")
     args = parser.parse_args(normalize_resume_argv(sys.argv[1:]))
@@ -2783,6 +2920,14 @@ def main():
             sys.exit(1)
         restored = app.restore_session(data)
         print(f"resumed session {data['id']} ({restored} messages, model {app.model})")
+
+    if args.cmd in ("review", "commit"):
+        try:
+            (cmd_review if args.cmd == "review" else cmd_commit)(args, app)
+        except CtxError as e:
+            eprint(f"error: {e}")
+            sys.exit(1)
+        return
 
     if args.cmd == "ask":
         question = " ".join(args.question)
